@@ -44,7 +44,20 @@ macro(build_mcap_vendor)
   )
 
   foreach(PATCH ${PATCHES})
-    execute_process(COMMAND git apply --whitespace=nowarn -p1 ${PATCH})
+    execute_process(
+      COMMAND git apply --reverse --check -p1 ${PATCH}
+      RESULT_VARIABLE PATCH_NOT_APPLIED
+      OUTPUT_QUIET ERROR_QUIET
+    )
+    if(PATCH_NOT_APPLIED)
+      execute_process(
+        COMMAND git apply --whitespace=nowarn -p1 ${PATCH}
+        RESULT_VARIABLE PATCH_RESULT
+      )
+      if(PATCH_RESULT)
+        message(FATAL_ERROR "Failed to apply ${PATCH}")
+      endif()
+    endif()
   endforeach()
 
   add_library(mcap SHARED

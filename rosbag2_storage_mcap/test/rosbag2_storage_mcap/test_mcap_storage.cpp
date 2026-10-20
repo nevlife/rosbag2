@@ -25,8 +25,10 @@
 #include <gmock/gmock.h>
 
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
+#include <vector>
 
 using namespace ::testing;  // NOLINT
 using TemporaryDirectoryFixture = rosbag2_test_common::TemporaryDirectoryFixture;
@@ -325,3 +327,83 @@ TEST_F(TemporaryDirectoryFixture, can_write_mcap_with_zstd_configured_from_yaml)
 }
 
 #endif  // #ifdef ROSBAG2_STORAGE_MCAP_HAS_STORAGE_OPTIONS
+
+TEST_F(McapStorageTestFixture, retained_messages_survive_read_seek_close_and_resize)
+{
+  const std::vector<std::string> configs = {
+    "compression: None\nnoChunkCRC: true\n", "compression: None\nnoChunkCRC: false\n",
+    "compression: Lz4\nforceCompression: true\n", "compression: Zstd\nforceCompression: true\n",
+    "noChunking: true\n"};
+  for (size_t config = 0; config < configs.size(); ++config) {
+    SCOPED_TRACE(config);
+    auto config_path = std::filesystem::path(temporary_dir_path_) / "writer.yaml";
+    std::ofstream(config_path) << "chunkSize: 2097152\n" << configs[config];
+    rosbag2_storage::StorageOptions options;
+    options.uri = (std::filesystem::path(temporary_dir_path_) / std::to_string(config)).string();
+    options.storage_id = "mcap";
+    options.storage_config_uri = config_path.string();
+    rosbag2_storage::StorageFactory factory;
+    {
+      auto writer = factory.open_read_write(options);
+      ASSERT_NE(writer, nullptr);
+      writer->create_topic({0, "topic", "std_msgs/msg/String", "cdr", {}, ""},
+                           {"std_msgs/msg/String", "ros2msg", "string data", ""});
+      for (int64_t i = 0; i < 6; ++i) {
+        auto message = std::make_shared<rosbag2_storage::SerializedBagMessage>();
+        message->topic_name = "topic";
+        message->recv_timestamp = (i / 3 * 3 + 2 - i % 3) * 1000000000;
+        message->send_timestamp = i * 1000000000;
+        message->serialized_data = make_serialized_message(std::string(1048576, 'a' + i));
+        writer->write(message);
+      }
+    }
+    options.uri += ".mcap";
+    options.storage_config_uri.clear();
+    for (bool reverse : {false, true}) {
+      for (auto order :
+           {rosbag2_storage::ReadOrder::File, rosbag2_storage::ReadOrder::ReceivedTimestamp}) {
+        SCOPED_TRACE(reverse);
+        SCOPED_TRACE(static_cast<int>(order));
+        auto reader = factory.open_read_only(options);
+        ASSERT_NE(reader, nullptr);
+        if (!reader->set_read_order({order, reverse})) {
+          continue;
+        }
+        if (reverse) {
+          reader->seek(6000000000);
+        }
+        std::vector<std::shared_ptr<rosbag2_storage::SerializedBagMessage>> messages;
+        while (reader->has_next()) {
+          messages.push_back(reader->read_next());
+        }
+        ASSERT_EQ(messages.size(), 6u);
+        reader->seek(0);
+        reader->reset_filter();
+        (void)reader->has_next();
+        reader.reset();
+        rclcpp::Serialization<std_msgs::msg::String> serialization;
+        for (size_t i = 0; i < messages.size(); ++i) {
+          size_t index = reverse ? messages.size() - 1 - i : i;
+          size_t expected =
+            order == rosbag2_storage::ReadOrder::File ? index : index / 3 * 3 + 2 - index % 3;
+          rclcpp::SerializedMessage serialized(*messages[i]->serialized_data);
+          std_msgs::msg::String decoded;
+          serialization.deserialize_message(&serialized, &decoded);
+          EXPECT_EQ(decoded.data, std::string(1048576, 'a' + expected));
+        }
+        rclcpp::SerializedMessage copied(*messages.front()->serialized_data);
+        auto & data = *messages.front()->serialized_data;
+        auto old_length = data.buffer_length;
+        auto last_byte = data.buffer[old_length - 1];
+        ASSERT_EQ(rcutils_uint8_array_resize(&data, old_length * 2), RCUTILS_RET_OK);
+        EXPECT_EQ(data.buffer[old_length - 1], last_byte);
+        data.buffer[old_length] = 42;
+        messages.clear();
+        copied.reserve(copied.capacity() * 2);
+        std_msgs::msg::String decoded;
+        serialization.deserialize_message(&copied, &decoded);
+        EXPECT_EQ(decoded.data.size(), 1048576u);
+      }
+    }
+  }
+}

@@ -1,0 +1,481 @@
+--- a/_deps/mcap-src/cpp/mcap/include/mcap/types.hpp
++++ b/_deps/mcap-src/cpp/mcap/include/mcap/types.hpp
+@@ -87,6 +87,7 @@
+   OpCode opcode;
+   uint64_t dataSize;
+   std::byte* data;
++  std::shared_ptr<const void> dataOwner{};
+ 
+   uint64_t recordSize() const {
+     return sizeof(opcode) + sizeof(dataSize) + dataSize;
+@@ -205,6 +206,7 @@
+    * iterator is advanced.
+    */
+   const std::byte* data = nullptr;
++  std::shared_ptr<const void> dataOwner{};
+ };
+ 
+ /**
+@@ -219,6 +221,7 @@
+   std::string compression;
+   ByteOffset compressedSize;
+   const std::byte* records = nullptr;
++  std::shared_ptr<const void> dataOwner{};
+ };
+ 
+ /**
+--- a/_deps/mcap-src/cpp/mcap/include/mcap/reader.hpp
++++ b/_deps/mcap-src/cpp/mcap/include/mcap/reader.hpp
+@@ -66,6 +66,8 @@
+    *   method should return 0.
+    */
+   virtual uint64_t read(std::byte** output, uint64_t offset, uint64_t size) = 0;
++  // An owner keeps the last read buffer valid across subsequent reads.
++  virtual std::shared_ptr<const void> dataOwner() const { return {}; }
+ };
+ 
+ /**
+@@ -77,11 +79,12 @@
+   FileReader(std::FILE* file);
+ 
+   uint64_t size() const override;
++  std::shared_ptr<const void> dataOwner() const override;
+   uint64_t read(std::byte** output, uint64_t offset, uint64_t size) override;
+ 
+ private:
+   std::FILE* file_;
+-  std::vector<std::byte> buffer_;
++  std::shared_ptr<ByteArray> buffer_ = std::make_shared<ByteArray>();
+   uint64_t size_;
+   uint64_t position_;
+ };
+@@ -94,11 +97,12 @@
+   FileStreamReader(std::ifstream& stream);
+ 
+   uint64_t size() const override;
++  std::shared_ptr<const void> dataOwner() const override;
+   uint64_t read(std::byte** output, uint64_t offset, uint64_t size) override;
+ 
+ private:
+   std::ifstream& stream_;
+-  std::vector<std::byte> buffer_;
++  std::shared_ptr<ByteArray> buffer_ = std::make_shared<ByteArray>();
+   uint64_t size_;
+   uint64_t position_;
+ };
+@@ -137,7 +141,9 @@
+   void reset(const std::byte* data, uint64_t size, uint64_t uncompressedSize) override;
+   uint64_t read(std::byte** output, uint64_t offset, uint64_t size) override;
+   uint64_t size() const override;
++  std::shared_ptr<const void> dataOwner() const override;
+   Status status() const override;
++  void setDataOwner(std::shared_ptr<const void> owner);
+ 
+   BufferReader() = default;
+   BufferReader(const BufferReader&) = delete;
+@@ -146,6 +152,7 @@
+   BufferReader& operator=(BufferReader&&) = delete;
+ 
+ private:
++  std::shared_ptr<const void> dataOwner_;
+   const std::byte* data_;
+   uint64_t size_;
+ };
+@@ -160,6 +167,7 @@
+   void reset(const std::byte* data, uint64_t size, uint64_t uncompressedSize) override;
+   uint64_t read(std::byte** output, uint64_t offset, uint64_t size) override;
+   uint64_t size() const override;
++  std::shared_ptr<const void> dataOwner() const override;
+   Status status() const override;
+ 
+   /**
+@@ -182,7 +190,7 @@
+ 
+ private:
+   Status status_;
+-  ByteArray uncompressedData_;
++  std::shared_ptr<ByteArray> uncompressedData_ = std::make_shared<ByteArray>();
+ };
+ #endif
+ 
+@@ -196,6 +204,7 @@
+   void reset(const std::byte* data, uint64_t size, uint64_t uncompressedSize) override;
+   uint64_t read(std::byte** output, uint64_t offset, uint64_t size) override;
+   uint64_t size() const override;
++  std::shared_ptr<const void> dataOwner() const override;
+   Status status() const override;
+ 
+   /**
+@@ -221,7 +230,7 @@
+   void* decompressionContext_ = nullptr;  // LZ4F_dctx*
+   Status status_;
+   const std::byte* compressedData_;
+-  ByteArray uncompressedData_;
++  std::shared_ptr<ByteArray> uncompressedData_ = std::make_shared<ByteArray>();
+   uint64_t compressedSize_;
+   uint64_t uncompressedSize_;
+ };
+@@ -626,7 +635,10 @@
+ 
+ private:
+   struct ChunkSlot {
+-    ByteArray decompressedChunk;
++    std::shared_ptr<ByteArray> decompressedChunk = std::make_shared<ByteArray>();
++    std::shared_ptr<const void> dataOwner;
++    const std::byte* data = nullptr;
++    uint64_t size = 0;
+     ByteOffset chunkStartOffset;
+     int unreadMessages = 0;
+   };
+--- a/_deps/mcap-src/cpp/mcap/include/mcap/reader.inl
++++ b/_deps/mcap-src/cpp/mcap/include/mcap/reader.inl
+@@ -18,6 +18,7 @@
+ // BufferReader ////////////////////////////////////////////////////////////////
+ 
+ void BufferReader::reset(const std::byte* data, uint64_t size, uint64_t uncompressedSize) {
++  dataOwner_.reset();
+   (void)uncompressedSize;
+   assert(size == uncompressedSize);
+   data_ = data;
+@@ -32,6 +33,14 @@
+   const auto available = size_ - offset;
+   *output = const_cast<std::byte*>(data_) + offset;
+   return std::min(size, available);
++}
++
++std::shared_ptr<const void> BufferReader::dataOwner() const {
++  return dataOwner_;
++}
++
++void BufferReader::setDataOwner(std::shared_ptr<const void> owner) {
++  dataOwner_ = std::move(owner);
+ }
+ 
+ uint64_t BufferReader::size() const {
+@@ -56,6 +65,10 @@
+   std::fseek(file_, 0, SEEK_SET);
+ }
+ 
++std::shared_ptr<const void> FileReader::dataOwner() const {
++  return buffer_;
++}
++
+ uint64_t FileReader::size() const {
+   return size_;
+ }
+@@ -71,12 +84,15 @@
+     position_ = offset;
+   }
+ 
+-  if (size > buffer_.size()) {
+-    buffer_.resize(size);
+-  }
+-
+-  const uint64_t bytesRead = uint64_t(std::fread(buffer_.data(), 1, size, file_));
+-  *output = buffer_.data();
++  if (!buffer_.unique()) {
++    buffer_ = std::make_shared<ByteArray>();
++  }
++  if (size > buffer_->size()) {
++    buffer_->resize(size);
++  }
++
++  const uint64_t bytesRead = uint64_t(std::fread(buffer_->data(), 1, size, file_));
++  *output = buffer_->data();
+ 
+   position_ += bytesRead;
+   return bytesRead;
+@@ -95,6 +111,10 @@
+   stream_.seekg(0, stream.beg);
+ }
+ 
++std::shared_ptr<const void> FileStreamReader::dataOwner() const {
++  return buffer_;
++}
++
+ uint64_t FileStreamReader::size() const {
+   return size_;
+ }
+@@ -109,12 +129,15 @@
+     position_ = offset;
+   }
+ 
+-  if (size > buffer_.size()) {
+-    buffer_.resize(size);
+-  }
+-
+-  stream_.read(reinterpret_cast<char*>(buffer_.data()), size);
+-  *output = buffer_.data();
++  if (!buffer_.unique()) {
++    buffer_ = std::make_shared<ByteArray>();
++  }
++  if (size > buffer_->size()) {
++    buffer_->resize(size);
++  }
++
++  stream_.read(reinterpret_cast<char*>(buffer_->data()), size);
++  *output = buffer_->data();
+ 
+   const uint64_t bytesRead = stream_.gcount();
+   position_ += bytesRead;
+@@ -147,8 +170,11 @@
+   }
+   compressedData_ = data;
+   compressedSize_ = size;
+-  status_ = decompressAll(data, size, uncompressedSize, &uncompressedData_);
+-  uncompressedSize_ = uncompressedData_.size();
++  if (!uncompressedData_.unique()) {
++    uncompressedData_ = std::make_shared<ByteArray>();
++  }
++  status_ = decompressAll(data, size, uncompressedSize, uncompressedData_.get());
++  uncompressedSize_ = uncompressedData_->size();
+ }
+ 
+ uint64_t LZ4Reader::read(std::byte** output, uint64_t offset, uint64_t size) {
+@@ -157,8 +183,12 @@
+   }
+ 
+   const auto available = uncompressedSize_ - offset;
+-  *output = uncompressedData_.data() + offset;
++  *output = uncompressedData_->data() + offset;
+   return std::min(size, available);
++}
++
++std::shared_ptr<const void> LZ4Reader::dataOwner() const {
++  return uncompressedData_;
+ }
+ 
+ uint64_t LZ4Reader::size() const {
+@@ -217,21 +247,28 @@
+ 
+ #ifndef MCAP_COMPRESSION_NO_ZSTD
+ void ZStdReader::reset(const std::byte* data, uint64_t size, uint64_t uncompressedSize) {
+-  status_ = DecompressAll(data, size, uncompressedSize, &uncompressedData_);
++  if (!uncompressedData_.unique()) {
++    uncompressedData_ = std::make_shared<ByteArray>();
++  }
++  status_ = DecompressAll(data, size, uncompressedSize, uncompressedData_.get());
+ }
+ 
+ uint64_t ZStdReader::read(std::byte** output, uint64_t offset, uint64_t size) {
+-  if (offset >= uncompressedData_.size()) {
++  if (offset >= uncompressedData_->size()) {
+     return 0;
+   }
+ 
+-  const auto available = uncompressedData_.size() - offset;
+-  *output = uncompressedData_.data() + offset;
++  const auto available = uncompressedData_->size() - offset;
++  *output = uncompressedData_->data() + offset;
+   return std::min(size, available);
+ }
+ 
++std::shared_ptr<const void> ZStdReader::dataOwner() const {
++  return uncompressedData_;
++}
++
+ uint64_t ZStdReader::size() const {
+-  return uncompressedData_.size();
++  return uncompressedData_->size();
+ }
+ 
+ Status ZStdReader::status() const {
+@@ -650,6 +687,7 @@
+ }
+ 
+ Status McapReader::ReadRecord(IReadable& reader, uint64_t offset, Record* record) {
++  record->dataOwner.reset();
+   // Check that we can read at least 9 bytes (opcode + length)
+   auto maxSize = reader.size() - offset;
+   if (maxSize < 9) {
+@@ -678,6 +716,7 @@
+     return Status{StatusCode::InvalidRecord, msg};
+   }
+   bytesRead = reader.read(&record->data, offset + 9, record->dataSize);
++  record->dataOwner = reader.dataOwner();
+   if (bytesRead != record->dataSize) {
+     const auto msg =
+       internal::StrCat("attempted to read ", record->dataSize, " bytes for record type 0x",
+@@ -856,6 +895,7 @@
+   message->publishTime = internal::ParseUint64(record.data + 2 + 4 + 8);
+   message->dataSize = record.dataSize - MessagePreambleSize;
+   message->data = record.data + MessagePreambleSize;
++  message->dataOwner = record.dataOwner;
+   return StatusCode::Success;
+ }
+ 
+@@ -895,6 +935,7 @@
+   }
+   // records
+   chunk->records = record.data + offset;
++  chunk->dataOwner = record.dataOwner;
+ 
+   return StatusCode::Success;
+ }
+@@ -1281,6 +1322,9 @@
+       return;
+   }
+   decompressor->reset(chunk.records, chunk.compressedSize, chunk.uncompressedSize);
++  if (compression == Compression::None) {
++    uncompressedReader_.setDataOwner(chunk.dataOwner);
++  }
+   reader_.reset(*decompressor, 0, decompressor->size());
+   status_ = decompressor->status();
+ }
+@@ -1867,27 +1911,39 @@
+                      internal::StrCat("unrecognized compression: ", chunk.compression));
+     return;
+   }
+-  slot.decompressedChunk.clear();
++  slot.dataOwner.reset();
++  slot.size = chunk.uncompressedSize;
++  if (*compression == Compression::None && chunk.dataOwner) {
++    slot.data = chunk.records;
++    slot.dataOwner = chunk.dataOwner;
++    return;
++  }
++  if (!slot.decompressedChunk.unique()) {
++    slot.decompressedChunk = std::make_shared<ByteArray>();
++  }
++  slot.decompressedChunk->clear();
+   if (*compression == Compression::None) {
+-    slot.decompressedChunk.insert(slot.decompressedChunk.end(), &chunk.records[0],
+-                                  &chunk.records[chunk.uncompressedSize]);
++    slot.decompressedChunk->insert(slot.decompressedChunk->end(), chunk.records,
++                                   chunk.records + chunk.uncompressedSize);
+   }
+ #ifndef MCAP_COMPRESSION_NO_LZ4
+   else if (*compression == Compression::Lz4) {
+     status_ = lz4Reader_.decompressAll(chunk.records, chunk.compressedSize, chunk.uncompressedSize,
+-                                       &slot.decompressedChunk);
++                                       slot.decompressedChunk.get());
+   }
+ #endif
+ #ifndef MCAP_COMPRESSION_NO_ZSTD
+   else if (*compression == Compression::Zstd) {
+     status_ = ZStdReader::DecompressAll(chunk.records, chunk.compressedSize, chunk.uncompressedSize,
+-                                        &slot.decompressedChunk);
++                                        slot.decompressedChunk.get());
+   }
+ #endif
+   else {
+     status_ = Status(StatusCode::UnsupportedCompression,
+                      internal::StrCat("unhandled compression: ", chunk.compression));
+   }
++  slot.data = slot.decompressedChunk->data();
++  slot.dataOwner = slot.decompressedChunk;
+ }
+ 
+ bool IndexedMessageReader::next() {
+@@ -1954,9 +2010,9 @@
+       assert(chunkSlot.unreadMessages > 0);
+       chunkSlot.unreadMessages--;
+       BufferReader reader;
+-      reader.reset(chunkSlot.decompressedChunk.data(), chunkSlot.decompressedChunk.size(),
+-                   chunkSlot.decompressedChunk.size());
+-      recordReader_.reset(reader, readMessageJob.offset.offset, chunkSlot.decompressedChunk.size());
++      reader.reset(chunkSlot.data, chunkSlot.size, chunkSlot.size);
++      reader.setDataOwner(chunkSlot.dataOwner);
++      recordReader_.reset(reader, readMessageJob.offset.offset, chunkSlot.size);
+       auto record = recordReader_.next();
+       status_ = recordReader_.status();
+       if (!status_.ok()) {
+--- a/_deps/mcap-src/cpp/mcap/include/mcap/writer.hpp
++++ b/_deps/mcap-src/cpp/mcap/include/mcap/writer.hpp
+@@ -473,7 +473,8 @@
+ 
+   IWritable& getOutput();
+   IChunkWriter* getChunkWriter();
+-  void writeChunk(IWritable& output, IChunkWriter& chunkData);
++  void writeChunk(IWritable& output, IChunkWriter& chunkData, const Message* finalMessage = nullptr);
++  static uint64_t writeChunkHeader(IWritable& output, const Chunk& chunk);
+ };
+ 
+ }  // namespace mcap
+--- a/_deps/mcap-src/cpp/mcap/include/mcap/writer.inl
++++ b/_deps/mcap-src/cpp/mcap/include/mcap/writer.inl
+@@ -539,8 +539,12 @@
+ 
+   const uint64_t messageOffset = uncompressedSize_;
+ 
+-  // Write the message
+-  uncompressedSize_ += write(output, message);
++  const uint64_t messageSize = 9 + 2 + 4 + 8 + 8 + message.dataSize;
++  const bool directWrite = compression_ == Compression::None && options_.noChunkCRC &&
++                           !options_.forceCompression && getChunkWriter() &&
++                           uncompressedSize_ + messageSize >= chunkSize_;
++  // A chunk closed in this call can write its final message from the caller's buffer.
++  uncompressedSize_ += directWrite ? messageSize : write(output, message);
+ 
+   // Update message statistics
+   if (!options_.noSummary) {
+@@ -571,7 +575,7 @@
+     // Check if the current chunk is ready to close
+     if (uncompressedSize_ >= chunkSize_) {
+       auto& fileOutput = *output_;
+-      writeChunk(fileOutput, *chunkWriter);
++      writeChunk(fileOutput, *chunkWriter, directWrite ? &message : nullptr);
+     }
+   }
+ 
+@@ -703,7 +707,7 @@
+   }
+ }
+ 
+-void McapWriter::writeChunk(IWritable& output, IChunkWriter& chunkData) {
++void McapWriter::writeChunk(IWritable& output, IChunkWriter& chunkData, const Message* finalMessage) {
+   // Both LZ4 and ZSTD recommend ~1KB as the minimum size for compressed data
+   constexpr uint64_t MIN_COMPRESSION_SIZE = 1024;
+   // Throw away any compression results that save less than 2% of the original size
+@@ -714,7 +718,7 @@
+   uint64_t compressedSize = uncompressedSize;
+   const std::byte* compressedData = chunkData.data();
+ 
+-  if (options_.forceCompression || uncompressedSize >= MIN_COMPRESSION_SIZE) {
++  if (!finalMessage && (options_.forceCompression || uncompressedSize >= MIN_COMPRESSION_SIZE)) {
+     // Flush any in-progress compression stream
+     chunkData.end();
+ 
+@@ -733,8 +737,15 @@
+ 
+   // Write the chunk
+   const uint64_t chunkStartOffset = output.size();
+-  write(output, Chunk{currentChunkStart_, currentChunkEnd_, uncompressedSize, uncompressedCrc,
+-                      compressionStr, compressedSize, compressedData});
++  const Chunk chunk{currentChunkStart_, currentChunkEnd_, uncompressedSize, uncompressedCrc,
++                    compressionStr, compressedSize, compressedData};
++  if (finalMessage) {
++    writeChunkHeader(output, chunk);
++    write(output, chunkData.data(), chunkData.size());
++    write(output, *finalMessage);
++  } else {
++    write(output, chunk);
++  }
+ 
+   const uint64_t chunkLength = output.size() - chunkStartOffset;
+ 
+@@ -908,7 +919,7 @@
+   return 9 + recordSize;
+ }
+ 
+-uint64_t McapWriter::write(IWritable& output, const Chunk& chunk) {
++uint64_t McapWriter::writeChunkHeader(IWritable& output, const Chunk& chunk) {
+   const uint64_t recordSize =
+     8 + 8 + 8 + 4 + 4 + chunk.compression.size() + 8 + chunk.compressedSize;
+ 
+@@ -920,9 +931,13 @@
+   write(output, chunk.uncompressedCrc);
+   write(output, chunk.compression);
+   write(output, chunk.compressedSize);
++  return 9 + recordSize - chunk.compressedSize;
++}
++
++uint64_t McapWriter::write(IWritable& output, const Chunk& chunk) {
++  const auto headerSize = writeChunkHeader(output, chunk);
+   write(output, chunk.records, chunk.compressedSize);
+-
+-  return 9 + recordSize;
++  return headerSize + chunk.compressedSize;
+ }
+ 
+ uint64_t McapWriter::write(IWritable& output, const MessageIndex& index) {

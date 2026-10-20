@@ -41,6 +41,7 @@
 #include <mcap/mcap.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -97,6 +98,85 @@ struct McapWriterOptions : mcap::McapWriterOptions
       : mcap::McapWriterOptions("ros2")
   {
   }
+};
+
+struct SharedMessage
+{
+  struct Buffer
+  {
+    std::shared_ptr<const void> owner;
+    size_t size;
+  };
+
+  struct Buffers
+  {
+    std::mutex mutex;
+    std::unordered_map<void *, Buffer> entries;
+  };
+
+  static Buffers & buffers()
+  {
+    static Buffers instance;
+    return instance;
+  }
+
+  explicit SharedMessage(const mcap::Message & message)
+      : data{reinterpret_cast<uint8_t *>(const_cast<std::byte *>(message.data)),
+             message.dataSize,
+             message.dataSize,
+             {allocate, deallocate, reallocate, zero_allocate, nullptr}}
+  {
+    auto & registry = buffers();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    registry.entries.emplace(data.buffer, Buffer{message.dataOwner, message.dataSize});
+  }
+
+  ~SharedMessage()
+  {
+    auto ret = rcutils_uint8_array_fini(&data);
+    if (ret != RCUTILS_RET_OK) {
+      RCUTILS_LOG_ERROR("Failed to finalize shared serialized message");
+    }
+  }
+
+  static void * allocate(size_t size, void *)
+  {
+    return std::malloc(size);
+  }
+
+  static void deallocate(void * pointer, void *)
+  {
+    auto & registry = buffers();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    if (registry.entries.erase(pointer) == 0) {
+      std::free(pointer);
+    }
+  }
+
+  static void * reallocate(void * pointer, size_t size, void *)
+  {
+    auto & registry = buffers();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    auto it = registry.entries.find(pointer);
+    if (it == registry.entries.end()) {
+      return std::realloc(pointer, size);
+    }
+    // The allocator can outlive the bag message when copied by rclcpp.
+    auto buffer = std::malloc(size);
+    if (buffer == nullptr) {
+      return nullptr;
+    }
+    std::memcpy(buffer, pointer, std::min(size, it->second.size));
+    registry.entries.erase(it);
+    return buffer;
+  }
+
+  static void * zero_allocate(size_t count, size_t size, void *)
+  {
+    return std::calloc(count, size);
+  }
+
+  rcutils_uint8_array_t data;
 };
 }  // namespace
 
@@ -556,8 +636,14 @@ bool MCAPStorage::read_and_enqueue_message()
   msg->recv_timestamp = rcutils_time_point_value_t(messageView.message.logTime);
   msg->send_timestamp = rcutils_time_point_value_t(messageView.message.publishTime);
   msg->topic_name = messageView.channel->topic;
-  msg->serialized_data = rosbag2_storage::make_serialized_message(messageView.message.data,
-                                                                  messageView.message.dataSize);
+  if (messageView.message.dataOwner) {
+    auto shared_message = std::make_shared<SharedMessage>(messageView.message);
+    msg->serialized_data =
+      std::shared_ptr<rcutils_uint8_array_t>(shared_message, &shared_message->data);
+  } else {
+    msg->serialized_data = rosbag2_storage::make_serialized_message(messageView.message.data,
+                                                                    messageView.message.dataSize);
+  }
 
   // enqueue this message to be used
   next_ = msg;

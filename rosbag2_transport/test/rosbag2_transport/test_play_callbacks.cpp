@@ -156,3 +156,33 @@ TEST_F(Rosbag2PlayCallbacksTestFixture, call_callbacks) {
   player.wait_for_playback_to_finish();
   EXPECT_FALSE(player.play_next());
 }
+
+TEST_F(Rosbag2PlayCallbacksTestFixture, publishing_preserves_retained_serialized_messages) {
+  using SerializedBagMessage = rosbag2_storage::SerializedBagMessage;
+  std::vector<std::shared_ptr<SerializedBagMessage>> retained;
+  std::vector<uint8_t *> buffers;
+  {
+    MockPlayer player(std::move(reader_), storage_options_, play_options_);
+    player.add_on_play_message_pre_callback(
+      [&](std::shared_ptr<SerializedBagMessage> message) {
+        retained.push_back(message);
+        buffers.push_back(message->serialized_data->buffer);
+      });
+    player.add_on_play_message_post_callback(
+      [&](std::shared_ptr<SerializedBagMessage> message) {
+        EXPECT_EQ(message->serialized_data->buffer, buffers.back());
+        EXPECT_GT(message->serialized_data->buffer_length, 0u);
+      });
+    player.play();
+    player.wait_for_playback_to_finish();
+  }
+  ASSERT_EQ(retained.size(), num_test_messages_);
+  rclcpp::Serialization<test_msgs::msg::Strings> serialization;
+  for (size_t i = 0; i < retained.size(); ++i) {
+    EXPECT_EQ(retained[i]->serialized_data->buffer, buffers[i]);
+    rclcpp::SerializedMessage serialized(*retained[i]->serialized_data);
+    test_msgs::msg::Strings decoded;
+    serialization.deserialize_message(&serialized, &decoded);
+    EXPECT_EQ(decoded.string_value, "Hello World");
+  }
+}

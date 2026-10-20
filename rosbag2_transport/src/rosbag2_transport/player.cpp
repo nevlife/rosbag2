@@ -26,6 +26,7 @@
 #include "rcl/graph.h"
 
 #include "rclcpp/rclcpp.hpp"
+#include "rcpputils/scope_exit.hpp"
 #include "rcpputils/unique_lock.hpp"
 #include "rcutils/time.h"
 
@@ -1454,7 +1455,12 @@ bool PlayerImpl::publish_message(rosbag2_storage::SerializedBagMessageSharedPtr 
 
     if (!pre_callbacks_failed) {
       try {
-        pub_iter->second->publish(rclcpp::SerializedMessage(*message->serialized_data));
+        auto serialized_data = *message->serialized_data;
+        rclcpp::SerializedMessage serialized_message(std::move(serialized_data));
+        // Publishing is synchronous; the bag message retains ownership of the buffer.
+        RCPPUTILS_SCOPE_EXIT(
+          serialized_message.release_rcl_serialized_message());
+        pub_iter->second->publish(serialized_message);
         message_published = true;
       } catch (const std::exception & e) {
         RCLCPP_ERROR_STREAM(owner_->get_logger(),
