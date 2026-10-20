@@ -16,6 +16,8 @@
 #define ROSBAG2_TRANSPORT__BAG_REWRITE_HPP_
 
 #include <memory>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -47,6 +49,16 @@ void bag_rewrite(
     std::pair<rosbag2_storage::StorageOptions, rosbag2_transport::RecordOptions>
   > & output_options
 );
+
+/// Zero-based, inclusive per-topic indices in the merged chronological input stream.
+using TopicMessageRanges = std::unordered_map<std::string, std::pair<size_t, size_t>>;
+
+/// One range map per output. Unspecified topics retain every message.
+ROSBAG2_TRANSPORT_PUBLIC
+void bag_rewrite(
+  const std::vector<rosbag2_storage::StorageOptions> & input_options,
+  const std::vector<std::pair<rosbag2_storage::StorageOptions, RecordOptions>> & output_options,
+  const std::vector<TopicMessageRanges> & message_ranges);
 }  // namespace rosbag2_transport
 
 #endif  // ROSBAG2_TRANSPORT__BAG_REWRITE_HPP_

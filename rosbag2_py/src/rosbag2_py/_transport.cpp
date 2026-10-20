@@ -847,14 +847,27 @@ void bag_rewrite(
 
   std::vector<
     std::pair<rosbag2_storage::StorageOptions, rosbag2_transport::RecordOptions>> output_options;
+  std::vector<rosbag2_transport::TopicMessageRanges> message_ranges;
   for (const auto & bag_node : bag_nodes) {
     rosbag2_storage::StorageOptions storage_options{};
     YAML::convert<rosbag2_storage::StorageOptions>::decode(bag_node, storage_options);
     rosbag2_transport::RecordOptions record_options = bag_rewrite_default_record_options();
     YAML::convert<rosbag2_transport::RecordOptions>::decode(bag_node, record_options);
     output_options.push_back(std::make_pair(storage_options, record_options));
+    rosbag2_transport::TopicMessageRanges ranges;
+    const auto range_node = bag_node["topic_message_ranges"];
+    if (range_node) {
+      if (!range_node.IsMap()) {
+        throw std::invalid_argument("topic_message_ranges must map topics to start/end indices");
+      }
+      for (const auto & entry : range_node) {
+        ranges[entry.first.as<std::string>()] = {
+          entry.second["start"].as<size_t>(), entry.second["end"].as<size_t>()};
+      }
+    }
+    message_ranges.push_back(std::move(ranges));
   }
-  rosbag2_transport::bag_rewrite(input_options, output_options);
+  rosbag2_transport::bag_rewrite(input_options, output_options, message_ranges);
 }
 
 }  // namespace rosbag2_py

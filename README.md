@@ -608,3 +608,23 @@ overrides; `RecordOptions` retains its Jazzy binary layout. Python callers can s
 frequencies. Relative topic names are resolved in the recorder namespace. Duplicate entries
 use the last value. This deliberately discards samples; record at full rate when every sample
 must be retained.
+
+### Per-topic message ranges when converting bags
+
+An output in a `ros2 bag convert` configuration can select inclusive, zero-based sample indices:
+
+```yaml
+output_bags:
+- uri: selected_samples
+  storage_id: mcap
+  all_topics: true
+  topic_message_ranges:
+    /camera/image_raw: {start: 10, end: 42}
+```
+
+Indices refer to each topic's merged chronological sequence across all input bags, including
+split files. Topics without a range retain all their messages. Missing topics, reversed bounds,
+and indices beyond the topic's message count are rejected before output files are created.
+This selects messages during a sequential scan. C++ callers use the three-argument
+`bag_rewrite` overload with one `TopicMessageRanges` map per output; the existing overload and
+`RecordOptions` layout remain available.

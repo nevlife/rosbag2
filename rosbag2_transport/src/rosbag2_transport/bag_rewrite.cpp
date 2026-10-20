@@ -14,7 +14,9 @@
 
 #include "rosbag2_transport/bag_rewrite.hpp"
 
+#include <algorithm>
 #include <map>
+#include <stdexcept>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -64,6 +66,29 @@ std::shared_ptr<rosbag2_storage::SerializedBagMessage> get_next(
     next_messages[earliest_msg_index].reset();
   }
   return earliest_msg;
+}
+
+void validate_message_ranges(
+  const std::vector<std::unique_ptr<rosbag2_cpp::Reader>> & input_bags,
+  const std::vector<rosbag2_transport::TopicMessageRanges> & message_ranges)
+{
+  std::unordered_map<std::string, size_t> counts;
+  for (const auto & reader : input_bags) {
+    for (const auto & topic : reader->get_metadata().topics_with_message_count) {
+      counts[topic.topic_metadata.name] += topic.message_count;
+    }
+  }
+  for (const auto & ranges : message_ranges) {
+    for (const auto & [topic, range] : ranges) {
+      const auto count = counts.find(topic);
+      if (count == counts.end()) {
+        throw std::invalid_argument("Message range topic does not exist: " + topic);
+      }
+      if (range.first > range.second || range.second >= count->second) {
+        throw std::invalid_argument("Invalid inclusive message range for topic: " + topic);
+      }
+    }
+  }
 }
 
 /// Discover what topics are in the inputs, filter out topics that can't be processed,
@@ -148,14 +173,24 @@ void perform_rewrite(
   const std::vector<std::unique_ptr<rosbag2_cpp::Reader>> & input_bags,
   const std::vector<
     std::pair<std::unique_ptr<rosbag2_cpp::Writer>, rosbag2_transport::RecordOptions>
-  > & output_bags
-)
+  > & output_bags,
+  const std::vector<rosbag2_transport::TopicMessageRanges> & message_ranges)
 {
   if (input_bags.empty() || output_bags.empty()) {
     throw std::runtime_error("Must provide at least one input and one output bag to rewrite.");
   }
 
   auto topic_outputs = setup_topic_filtering(input_bags, output_bags);
+  std::unordered_map<rosbag2_cpp::Writer *, const rosbag2_transport::TopicMessageRanges *>
+  writer_ranges;
+  size_t output_index = 0;
+  for (const auto & [writer, record_options] : output_bags) {
+    writer_ranges[writer.get()] = &message_ranges[output_index++];
+  }
+  std::unordered_map<std::string, size_t> topic_message_indices;
+  const bool select_ranges = std::any_of(
+    message_ranges.begin(), message_ranges.end(),
+    [](const auto & ranges) {return !ranges.empty();});
 
   std::vector<std::shared_ptr<rosbag2_storage::SerializedBagMessage>> next_messages;
   next_messages.resize(input_bags.size(), nullptr);
@@ -163,9 +198,20 @@ void perform_rewrite(
   std::shared_ptr<rosbag2_storage::SerializedBagMessage> next_msg;
   while ((next_msg = get_next(input_bags, next_messages))) {
     auto topic_writers = topic_outputs.find(next_msg->topic_name);
-    if (topic_writers != topic_outputs.end()) {
+    if (topic_writers != topic_outputs.end() && !select_ranges) {
       for (auto writer : topic_writers->second) {
         writer->write(next_msg);
+      }
+    } else if (topic_writers != topic_outputs.end()) {
+      const auto index = topic_message_indices[next_msg->topic_name]++;
+      for (auto writer : topic_writers->second) {
+        const auto ranges = writer_ranges.at(writer);
+        const auto range = ranges->find(next_msg->topic_name);
+        if (range == ranges->end() ||
+          (index >= range->second.first && index <= range->second.second))
+        {
+          writer->write(next_msg);
+        }
       }
     }
   }
@@ -182,6 +228,21 @@ void bag_rewrite(
   > & output_options
 )
 {
+  bag_rewrite(input_options, output_options,
+      std::vector<TopicMessageRanges>(output_options.size()));
+}
+
+void bag_rewrite(
+  const std::vector<rosbag2_storage::StorageOptions> & input_options,
+  const std::vector<std::pair<rosbag2_storage::StorageOptions, RecordOptions>> & output_options,
+  const std::vector<TopicMessageRanges> & message_ranges)
+{
+  if (message_ranges.size() != output_options.size()) {
+    throw std::invalid_argument("Message ranges must have one entry per output bag");
+  }
+  if (input_options.empty() || output_options.empty()) {
+    throw std::runtime_error("Must provide at least one input and one output bag to rewrite.");
+  }
   std::vector<std::unique_ptr<rosbag2_cpp::Reader>> input_bags;
   std::vector<
     std::pair<std::unique_ptr<rosbag2_cpp::Writer>, rosbag2_transport::RecordOptions>
@@ -192,6 +253,8 @@ void bag_rewrite(
     reader->open(storage_options);
     input_bags.push_back(std::move(reader));
   }
+
+  validate_message_ranges(input_bags, message_ranges);
 
   for (auto & [storage_options, record_options] : output_options) {
     // TODO(emersonknapp) - utilize cache to get better performance.
@@ -206,6 +269,6 @@ void bag_rewrite(
     output_bags.push_back(std::make_pair(std::move(writer), record_options));
   }
 
-  perform_rewrite(input_bags, output_bags);
+  perform_rewrite(input_bags, output_bags, message_ranges);
 }
 }  // namespace rosbag2_transport

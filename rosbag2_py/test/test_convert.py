@@ -19,6 +19,7 @@ import pytest
 
 from rosbag2_py import bag_rewrite, StorageOptions
 from rosbag2_test_common import TESTED_STORAGE_IDS
+import yaml
 
 RESOURCES_PATH = Path(os.environ['ROSBAG2_PY_TEST_RESOURCES_DIR'])
 
@@ -73,3 +74,47 @@ output_bags:
     assert output_uri_2.exists()
     assert output_uri_2.isdir()
     assert (output_uri_2 / 'metadata.yaml').exists()
+
+
+@pytest.mark.parametrize('storage_id', TESTED_STORAGE_IDS)
+def test_convert_inclusive_message_ranges(tmpdir, storage_id):
+    """Keep inclusive first and last message indices through YAML conversion."""
+    output = tmpdir / 'ranged'
+    config = tmpdir / 'ranged.yaml'
+    config.write(f"""
+output_bags:
+- uri: {output}
+  storage_id: {storage_id}
+  all_topics: true
+  topic_message_ranges:
+    a_empty: {{start: 0, end: 0}}
+    b_basictypes: {{start: 48, end: 49}}
+""")
+    bag_rewrite([StorageOptions(uri=str(RESOURCES_PATH / storage_id / 'convert_a'))],
+                str(config))
+    with (output / 'metadata.yaml').open() as stream:
+        metadata = yaml.safe_load(stream)['rosbag2_bagfile_information']
+    counts = {topic['topic_metadata']['name']: topic['message_count']
+              for topic in metadata['topics_with_message_count']}
+    assert counts == {'a_empty': 1, 'b_basictypes': 2}
+
+
+@pytest.mark.parametrize('bounds', [
+    '{start: 2, end: 1}', '{start: -1, end: 1}', '{start: 0, end: 100}',
+    '{start: 1}', '{end: 1}', '[]'])
+def test_convert_rejects_invalid_message_ranges(tmpdir, bounds):
+    """Reject invalid YAML ranges before creating an output bag."""
+    output = tmpdir / 'invalid'
+    config = tmpdir / 'invalid.yaml'
+    config.write(f"""
+output_bags:
+- uri: {output}
+  storage_id: mcap
+  all_topics: true
+  topic_message_ranges:
+    a_empty: {bounds}
+""")
+    with pytest.raises((ValueError, RuntimeError)):
+        bag_rewrite([StorageOptions(uri=str(RESOURCES_PATH / 'mcap' / 'convert_a'))],
+                    str(config))
+    assert not output.exists()
