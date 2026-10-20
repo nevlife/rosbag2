@@ -14,6 +14,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <limits>
+#include <optional>
 #include <future>
 #include <memory>
 #include <regex>
@@ -164,6 +167,7 @@ private:
   rclcpp::Event::SharedPtr discovery_graph_event_;
   std::future<void> discovery_future_;
   std::string serialization_format_;
+  std::unordered_map<std::string, int64_t> topic_throttle_periods_;
   std::unordered_map<std::string, rclcpp::QoS> topic_qos_profile_overrides_;
   std::unordered_set<std::string> topic_unknown_types_;
   rclcpp::Service<rosbag2_interfaces::srv::IsDiscoveryRunning>::SharedPtr srv_is_discovery_running_;
@@ -206,6 +210,28 @@ RecorderImpl::RecorderImpl(
   event_notifier_(std::make_unique<RecorderEventNotifier>(node, record_options))
 {
   event_notifier_->set_messages_lost_statistics_max_publishing_rate(0.0f);  // Disable by default
+
+  const auto entries = node->has_parameter("record.topic_throttle_frequency") ?
+    node->get_parameter("record.topic_throttle_frequency").as_string_array() :
+    node->declare_parameter<std::vector<std::string>>(
+    "record.topic_throttle_frequency", std::vector<std::string>{});
+  for (const auto & entry : entries) {
+    const auto separator = entry.find('=');
+    if (separator == std::string::npos || separator == 0 || separator + 1 == entry.size()) {
+      throw std::invalid_argument("record.topic_throttle_frequency expects <topic>=<frequency>");
+    }
+    const auto value = entry.substr(separator + 1);
+    size_t parsed = 0;
+    const auto frequency = std::stod(value, &parsed);
+    if (parsed != value.size() || !std::isfinite(frequency) || frequency <= 0.0) {
+      throw std::invalid_argument("Throttle frequency must be finite and greater than 0");
+    }
+    const auto topic = rclcpp::expand_topic_or_service_name(
+      entry.substr(0, separator), node->get_name(), node->get_namespace(), false);
+    const long double period = std::ceil(1e9L / frequency);
+    topic_throttle_periods_[topic] = period >= std::numeric_limits<int64_t>::max() ?
+      std::numeric_limits<int64_t>::max() : static_cast<int64_t>(period);
+  }
 
   if (record_options_.use_sim_time && record_options_.is_discovery_disabled) {
     throw std::runtime_error(
@@ -754,56 +780,53 @@ RecorderImpl::create_subscription(
       this->event_notifier_->on_messages_lost_in_transport(topic_name, msgs_lost_info);
     };
 
+  const auto throttle = topic_throttle_periods_.find(topic_name);
+  const int64_t period = throttle == topic_throttle_periods_.end() ? 0 : throttle->second;
+  auto write = [this, topic_name, topic_type, period,
+      last_written = period > 0 ? std::make_shared<std::optional<int64_t>>() : nullptr](
+    std::shared_ptr<const rclcpp::SerializedMessage> message, int64_t timestamp, int64_t source) {
+      if (paused_.load()) {
+        return;
+      }
+      if (period > 0 && *last_written && timestamp >= **last_written &&
+        static_cast<uint64_t>(timestamp) - static_cast<uint64_t>(**last_written) <
+        static_cast<uint64_t>(period))
+      {
+        return;
+      }
+      writer_->write(std::move(message), topic_name, topic_type, timestamp, source);
+      if (period > 0) {
+        *last_written = timestamp;
+      }
+    };
 #ifdef _WIN32
   if (std::string(rmw_get_implementation_identifier()).find("rmw_connextdds") !=
     std::string::npos)
   {
     return node->create_generic_subscription(
-      topic_name,
-      topic_type,
-      qos,
-      [this, topic_name, topic_type](std::shared_ptr<const rclcpp::SerializedMessage> message,
+      topic_name, topic_type, qos,
+      [this, write](std::shared_ptr<const rclcpp::SerializedMessage> message,
       const rclcpp::MessageInfo &) {
-        if (!paused_.load()) {
-          writer_->write(
-            std::move(message), topic_name, topic_type, node->now().nanoseconds(),
-            0);
-        }
-      },
-      sub_options);
+        write(std::move(message), node->now().nanoseconds(), 0);
+      }, sub_options);
   }
 #endif
-
   if (record_options_.use_sim_time) {
     return node->create_generic_subscription(
-      topic_name,
-      topic_type,
-      qos,
-      [this, topic_name, topic_type](std::shared_ptr<const rclcpp::SerializedMessage> message,
+      topic_name, topic_type, qos,
+      [this, write](std::shared_ptr<const rclcpp::SerializedMessage> message,
       const rclcpp::MessageInfo & mi) {
-        if (!paused_.load()) {
-          writer_->write(
-            std::move(message), topic_name, topic_type, node->now().nanoseconds(),
+        write(std::move(message), node->now().nanoseconds(),
             mi.get_rmw_message_info().source_timestamp);
-        }
-      },
-      sub_options);
-  } else {
-    return node->create_generic_subscription(
-      topic_name,
-      topic_type,
-      qos,
-      [this, topic_name, topic_type](std::shared_ptr<const rclcpp::SerializedMessage> message,
-      const rclcpp::MessageInfo & mi) {
-        if (!paused_.load()) {
-          writer_->write(
-            std::move(message), topic_name, topic_type,
-            mi.get_rmw_message_info().received_timestamp,
-            mi.get_rmw_message_info().source_timestamp);
-        }
-      },
-      sub_options);
+      }, sub_options);
   }
+  return node->create_generic_subscription(
+    topic_name, topic_type, qos,
+    [write](std::shared_ptr<const rclcpp::SerializedMessage> message,
+    const rclcpp::MessageInfo & mi) {
+      write(std::move(message), mi.get_rmw_message_info().received_timestamp,
+          mi.get_rmw_message_info().source_timestamp);
+    }, sub_options);
 }
 
 std::vector<rclcpp::QoS> RecorderImpl::offered_qos_profiles_for_topic(

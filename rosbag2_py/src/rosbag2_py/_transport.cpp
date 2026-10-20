@@ -16,6 +16,9 @@
 #include <csignal>
 #include <chrono>
 #include <memory>
+#include <iomanip>
+#include <limits>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -154,7 +157,23 @@ public:
   py::dict py_dict;
 };
 typedef OptionsWrapper<rosbag2_transport::PlayOptions> PlayOptions;
-typedef OptionsWrapper<rosbag2_transport::RecordOptions> RecordOptions;
+struct RecordOptions : OptionsWrapper<rosbag2_transport::RecordOptions>
+{
+  std::unordered_map<std::string, double> topic_throttle_frequencies;
+
+  rclcpp::NodeOptions recorder_node_options() const
+  {
+    std::vector<std::string> entries;
+    for (const auto & [topic, frequency] : topic_throttle_frequencies) {
+      std::ostringstream value;
+      value << topic << '=' << std::setprecision(std::numeric_limits<double>::max_digits10) <<
+        frequency;
+      entries.push_back(value.str());
+    }
+    return rclcpp::NodeOptions().parameter_overrides({
+        rclcpp::Parameter("record.topic_throttle_frequency", entries)});
+  }
+};
 
 }  // namespace
 
@@ -587,7 +606,8 @@ public:
     auto writer = rosbag2_transport::ReaderWriterFactory::make_writer(record_options);
 
     recorder_ = std::make_shared<rosbag2_transport::Recorder>(
-      std::move(writer), storage_options, record_options, node_name);
+      std::move(writer), storage_options, record_options, node_name,
+      record_options.recorder_node_options());
   }
 
   virtual ~Recorder()
@@ -690,7 +710,8 @@ public:
     auto writer = rosbag2_transport::ReaderWriterFactory::make_writer(record_options);
 
     recorder_ = std::make_shared<rosbag2_transport::Recorder>(
-      std::move(writer), storage_options, record_options, node_name);
+      std::move(writer), storage_options, record_options, node_name,
+      record_options.recorder_node_options());
 
     record_impl();
   }
@@ -927,6 +948,7 @@ PYBIND11_MODULE(_transport, m) {
   .def_readwrite("services", &RecordOptions::services)
   .def_readwrite("all_services", &RecordOptions::all_services)
   .def_readwrite("disable_keyboard_controls", &RecordOptions::disable_keyboard_controls)
+  .def_readwrite("topic_throttle_frequencies", &RecordOptions::topic_throttle_frequencies)
   ;
 
   py::class_<rosbag2_py::Player>(m, "Player")

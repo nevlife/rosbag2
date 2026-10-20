@@ -591,3 +591,20 @@ For example, you want a timestamp on the bag directory name, but want a custom p
 $ ros2 bag record -a -o mybag_"$(date +"%Y_%m_%d-%H_%M_%S")"
 ... creates e.g. mybag_2025_02_21-15_35_35
 ```
+
+### Per-topic recording frequency
+
+Use `ros2 bag record -a --topic-throttle-frequency /imu=10 /camera/image_raw=2`
+to limit selected topics in Hz. Other topics are recorded at full frequency. The recorder
+filters serialized messages before writer caching, compression and storage. The first message
+is kept; subsequent messages must be at least one period apart in receive time. Simulation time
+is used with `--use-sim-time`, and a backward clock jump restarts the throttle window. Paused
+messages do not advance that window.
+
+The composable recorder accepts the string-array parameter `record.topic_throttle_frequency`
+with entries such as `/imu=10`. C++ callers can supply it through `NodeOptions` parameter
+overrides; `RecordOptions` retains its Jazzy binary layout. Python callers can set
+`RecordOptions.topic_throttle_frequencies` to a dictionary of topic names and positive, finite
+frequencies. Relative topic names are resolved in the recorder namespace. Duplicate entries
+use the last value. This deliberately discards samples; record at full rate when every sample
+must be retained.

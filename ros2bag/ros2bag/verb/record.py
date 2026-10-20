@@ -14,6 +14,7 @@
 
 from argparse import ArgumentParser, FileType
 import datetime
+import math
 import os
 import signal
 import threading
@@ -36,6 +37,23 @@ from rosbag2_py import Recorder
 from rosbag2_py import RecordOptions
 from rosbag2_py import StorageOptions
 import yaml
+
+
+def parse_topic_throttle_frequencies(values):
+    """Parse per-topic positive, finite recording frequencies."""
+    frequencies = {}
+    for value in values:
+        topic, separator, frequency_str = value.partition('=')
+        if not topic or not separator or not frequency_str:
+            raise ValueError('Expected format <topic>=<frequency>')
+        try:
+            frequency = float(frequency_str)
+        except ValueError as exc:
+            raise ValueError('Frequency must be a positive number') from exc
+        if not math.isfinite(frequency) or frequency <= 0.0:
+            raise ValueError('Frequency must be finite and greater than 0')
+        frequencies[topic] = frequency
+    return frequencies
 
 
 def add_recorder_arguments(parser: ArgumentParser) -> None:
@@ -184,6 +202,10 @@ def add_recorder_arguments(parser: ArgumentParser) -> None:
         choices=['debug', 'info', 'warn', 'error', 'fatal'],
         help='Logging level.')
 
+    parser.add_argument(
+        '--topic-throttle-frequency', type=str, default=[], metavar='Topic=Hz', nargs='+',
+        help='Limit recording frequency per topic. Format: <topic>=<frequency in Hz>.')
+
     # Storage configuration
     add_writer_storage_plugin_extensions(parser)
 
@@ -285,6 +307,12 @@ def validate_parsed_arguments(args, uri) -> str:
     if args.compression_queue_size < 0:
         return print_error('Compression queue size must be at least 0.')
 
+    try:
+        args.topic_throttle_frequencies = parse_topic_throttle_frequencies(
+            args.topic_throttle_frequency)
+    except ValueError as exc:
+        return print_error(str(exc))
+
 
 # Create termination event
 termination_requested = threading.Event()
@@ -369,6 +397,8 @@ class RecordVerb(VerbExtension):
         record_options.ignore_leaf_topics = args.ignore_leaf_topics
         record_options.use_sim_time = args.use_sim_time
         record_options.disable_keyboard_controls = args.disable_keyboard_controls
+
+        record_options.topic_throttle_frequencies = args.topic_throttle_frequencies
 
         recorder = Recorder(storage_options, record_options, args.log_level, args.node_name)
 
