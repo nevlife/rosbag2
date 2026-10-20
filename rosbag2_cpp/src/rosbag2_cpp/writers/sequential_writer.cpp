@@ -181,7 +181,7 @@ void SequentialWriter::open(
       converter_->add_topic(topic_name, topic_info.topic_metadata.type);
     }
   }
-  storage_->update_metadata(metadata_);
+  update_current_storage_metadata();
   is_open_ = true;
 }
 
@@ -194,7 +194,7 @@ void SequentialWriter::flush_cache_update_metadata_and_close_storage()
   }
   finalize_metadata();
   if (storage_) {
-    storage_->update_metadata(metadata_);
+    update_current_storage_metadata();
     storage_.reset();  // Destroy storage before calling WRITE_SPLIT callback to make sure that
     // bag file was closed before callback call.
   }
@@ -325,7 +325,7 @@ void SequentialWriter::switch_to_next_storage()
     message_cache_->log_dropped();
   }
 
-  storage_->update_metadata(metadata_);
+  update_current_storage_metadata();
   storage_options_.uri = format_storage_uri(
     base_folder_,
     metadata_.relative_file_paths.size());
@@ -347,7 +347,7 @@ void SequentialWriter::switch_to_next_storage()
   metadata_.files.push_back(file_info);
   metadata_.relative_file_paths.push_back(file_info.path);
 
-  storage_->update_metadata(metadata_);
+  update_current_storage_metadata();
   {
     // Re-register all topics since we rolled-over to a new bagfile.
     std::lock_guard<std::mutex> lock(topics_info_mutex_);
@@ -535,6 +535,32 @@ void SequentialWriter::finalize_metadata()
     metadata_.topics_with_message_count.push_back(topic.second);
     metadata_.message_count += topic.second.message_count;
   }
+}
+
+void SequentialWriter::update_current_storage_metadata()
+{
+  // Construct the bounded copy directly, without copying the growing file-history vectors.
+  rosbag2_storage::BagMetadata current_metadata{
+    metadata_.version,
+    metadata_.bag_size,
+    metadata_.storage_identifier,
+    {metadata_.relative_file_paths.back()},
+    {metadata_.files.back()},
+    metadata_.duration,
+    metadata_.starting_time,
+    0,
+    {},
+    metadata_.compression_format,
+    metadata_.compression_mode,
+    metadata_.custom_data,
+    metadata_.ros_distro
+  };
+  current_metadata.topics_with_message_count.reserve(topics_names_to_info_.size());
+  for (const auto & topic : topics_names_to_info_) {
+    current_metadata.topics_with_message_count.push_back(topic.second);
+    current_metadata.message_count += topic.second.message_count;
+  }
+  storage_->update_metadata(current_metadata);
 }
 
 void SequentialWriter::write_messages(

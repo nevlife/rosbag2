@@ -202,6 +202,9 @@ protected:
   // Record TopicInformation into metadata
   void finalize_metadata();
 
+  // Embed only the current file; metadata.yaml retains the full recording history.
+  void update_current_storage_metadata();
+
   // Helper method used by write to get the message in a format that is ready to be written.
   // Common use cases include converting the message using the converter or
   // performing other operations like compression on it

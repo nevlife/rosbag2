@@ -23,6 +23,8 @@
 
 #include "rosbag2_cpp/writers/sequential_writer.hpp"
 #include "rosbag2_cpp/writer.hpp"
+#include "rosbag2_cpp/readers/sequential_reader.hpp"
+#include "rosbag2_cpp/reindexer.hpp"
 
 #include "rosbag2_storage/bag_metadata.hpp"
 #include "rosbag2_storage/ros_helper.hpp"
@@ -268,8 +270,8 @@ TEST_F(SequentialWriterTest, sequantial_writer_call_metadata_update_on_bag_split
   EXPECT_TRUE(v_intercepted_update_metadata_[0].compression_mode.empty());
   EXPECT_EQ(v_intercepted_update_metadata_[0].message_count, 0u);  // On opening first bag file
   EXPECT_EQ(v_intercepted_update_metadata_[1].files.size(), 1u);   // On closing first bag file
-  EXPECT_EQ(v_intercepted_update_metadata_[2].files.size(), 2u);   // On opening second bag file
-  EXPECT_EQ(v_intercepted_update_metadata_[3].files.size(), 2u);   // On writer destruction
+  EXPECT_EQ(v_intercepted_update_metadata_[2].files.size(), 1u);   // On opening second bag file
+  EXPECT_EQ(v_intercepted_update_metadata_[3].files.size(), 1u);   // On writer destruction
   EXPECT_EQ(v_intercepted_update_metadata_[3].message_count, 2 * kNumMessagesToWrite);
 }
 
@@ -982,6 +984,78 @@ TEST_P(ParametrizedTemporaryDirectoryFixture, split_bag_metadata_has_full_durati
     metadata.starting_time,
     std::chrono::high_resolution_clock::time_point(std::chrono::nanoseconds(100)));
   ASSERT_EQ(metadata.duration, std::chrono::nanoseconds(500));
+}
+
+TEST_F(SequentialWriterTest, embedded_metadata_does_not_grow_with_split_history) {
+  ON_CALL(*storage_, get_relative_file_path()).WillByDefault(
+    Invoke([this]() {return fake_storage_uri_;}));
+  ON_CALL(*metadata_io_, write_metadata).WillByDefault(
+    [this](const std::string &, const rosbag2_storage::BagMetadata & metadata) {
+      fake_metadata_ = metadata;
+    });
+  auto sequential_writer = std::make_unique<rosbag2_cpp::writers::SequentialWriter>(
+    std::move(storage_factory_), converter_factory_, std::move(metadata_io_));
+  writer_ = std::make_unique<rosbag2_cpp::Writer>(std::move(sequential_writer));
+  storage_options_.custom_data = {{"key", "value"}};
+  writer_->open(storage_options_, {"cdr", "cdr"});
+  writer_->create_topic({0u, "test_topic", "test_msgs/BasicTypes", "cdr", {}, ""});
+  for (size_t i = 0; i < 100; ++i) {
+    writer_->write(make_test_msg());
+    if (i < 99) {
+      writer_->split_bagfile();
+    }
+  }
+  writer_->close();
+  ASSERT_EQ(v_intercepted_update_metadata_.size(), 200u);
+  for (size_t i = 0; i < v_intercepted_update_metadata_.size(); ++i) {
+    const auto & metadata = v_intercepted_update_metadata_[i];
+    ASSERT_EQ(metadata.relative_file_paths.size(), 1u);
+    ASSERT_EQ(metadata.files.size(), 1u);
+    EXPECT_EQ(metadata.files[0].path, metadata.relative_file_paths[0]);
+    EXPECT_EQ(metadata.files[0].path, bag_base_dir_ + "_" + std::to_string(i / 2));
+    EXPECT_EQ(metadata.custom_data, storage_options_.custom_data);
+  }
+  EXPECT_EQ(fake_metadata_.relative_file_paths.size(), 100u);
+  EXPECT_EQ(fake_metadata_.files.size(), 100u);
+  EXPECT_EQ(fake_metadata_.message_count, 100u);
+  ASSERT_EQ(fake_metadata_.topics_with_message_count.size(), 1u);
+  EXPECT_EQ(fake_metadata_.topics_with_message_count[0].message_count, 100u);
+}
+
+TEST_P(ParametrizedTemporaryDirectoryFixture, split_bag_standalone_file_and_reindex) {
+  rosbag2_storage::StorageOptions options;
+  options.uri = (fs::path(temporary_dir_path_) / "standalone_bag").generic_string();
+  options.storage_id = GetParam();
+  write_sample_split_bag(options, {{100, 1}, {200, 2}, {300, 3}}, 1);
+  rosbag2_storage::MetadataIo metadata_io;
+  const auto metadata = metadata_io.read_metadata(options.uri);
+  ASSERT_EQ(metadata.relative_file_paths.size(), 3u);
+
+  auto count_messages = [&options](const std::string & uri) {
+      auto read_options = options;
+      read_options.uri = uri;
+      rosbag2_cpp::readers::SequentialReader reader;
+      reader.open(read_options, {"cdr", "cdr"});
+      size_t count = 0;
+      while (reader.has_next()) {
+        reader.read_next();
+        ++count;
+      }
+      return count;
+    };
+  EXPECT_EQ(count_messages(options.uri), 3u);
+  for (const auto & path : metadata.relative_file_paths) {
+    EXPECT_EQ(count_messages((fs::path(options.uri) / path).generic_string()), 1u);
+  }
+  fs::remove(fs::path(options.uri) / "metadata.yaml");
+  EXPECT_EQ(
+    count_messages((fs::path(options.uri) / metadata.relative_file_paths[1]).generic_string()),
+    1u);
+  EXPECT_THROW(count_messages(options.uri), std::runtime_error);
+  rosbag2_cpp::Reindexer reindexer;
+  reindexer.reindex(options);
+  EXPECT_EQ(count_messages(options.uri), 3u);
+  EXPECT_EQ(metadata_io.read_metadata(options.uri).message_count, 3u);
 }
 
 INSTANTIATE_TEST_SUITE_P(
