@@ -32,6 +32,8 @@
 #include "rclcpp/logging.hpp"
 #include "rclcpp/clock.hpp"
 #include "rclcpp/event.hpp"
+#include "rclcpp/executors/single_threaded_executor.hpp"
+#include "rclcpp/typesupport_helpers.hpp"
 
 #include "rmw/types.h"
 
@@ -44,6 +46,9 @@
 #include "rosbag2_storage/yaml.hpp"
 #include "rosbag2_storage/qos.hpp"
 
+#include "type_description_interfaces/srv/get_type_description.hpp"
+
+#include "described_type_support.hpp"
 #include "logging.hpp"
 #include "rosbag2_transport/config_options_from_node_params.hpp"
 #include "rosbag2_transport/reader_writer_factory.hpp"
@@ -125,6 +130,18 @@ private:
   std::shared_ptr<rclcpp::GenericSubscription> create_subscription(
     const std::string & topic_name, const std::string & topic_type, const rclcpp::QoS & qos);
 
+  rclcpp::SubscriptionOptions subscription_options(const std::string & topic_name);
+
+  DescribedTypeSubscription::Callback record_callback(
+    const std::string & topic_name, const std::string & topic_type);
+
+  /// Subscribe to a topic whose type is not installed, with the description that its publishers'
+  /// type description services give.
+  void subscribe_described_topic(const rosbag2_storage::TopicMetadata & topic);
+
+  std::pair<std::shared_ptr<const DescribedTypeSupport>, std::string>
+  describe_type(const rosbag2_storage::TopicMetadata & topic);
+
   /**
    * Find the QoS profile that should be used for subscribing.
    *
@@ -169,7 +186,9 @@ private:
   std::string serialization_format_;
   std::unordered_map<std::string, int64_t> topic_throttle_periods_;
   std::unordered_map<std::string, rclcpp::QoS> topic_qos_profile_overrides_;
+  // Topics whose type is neither installed nor described by their publishers.
   std::unordered_set<std::string> topic_unknown_types_;
+  rclcpp::CallbackGroup::SharedPtr type_description_group_;
   rclcpp::Service<rosbag2_interfaces::srv::IsDiscoveryRunning>::SharedPtr srv_is_discovery_running_;
   rclcpp::Service<rosbag2_interfaces::srv::IsPaused>::SharedPtr srv_is_paused_;
   rclcpp::Service<rosbag2_interfaces::srv::Pause>::SharedPtr srv_pause_;
@@ -285,7 +304,8 @@ RecorderImpl::RecorderImpl(
     topic_qos_profile_overrides_.emplace(expanded_topic_name, qos);
   }
 
-  topic_filter_ = std::make_unique<TopicFilter>(record_options_, node->get_node_graph_interface());
+  topic_filter_ = std::make_unique<TopicFilter>(
+    record_options_, node->get_node_graph_interface(), true);
 
   create_control_services();
 }
@@ -745,7 +765,16 @@ void RecorderImpl::subscribe_topics(
 
 void RecorderImpl::subscribe_topic(const rosbag2_storage::TopicMetadata & topic)
 {
-  if (subscriptions_.find(topic.name) != subscriptions_.end()) {
+  if (subscriptions_.find(topic.name) != subscriptions_.end() ||
+    topic_unknown_types_.count(topic.name) > 0)
+  {
+    return;
+  }
+  try {
+    rclcpp::get_typesupport_library_path(
+      std::get<0>(rclcpp::extract_type_identifier(topic.type)), "rosidl_typesupport_cpp");
+  } catch (const std::runtime_error &) {
+    subscribe_described_topic(topic);
     return;
   }
   // Need to create topic in writer before we are trying to create subscription. Since in
@@ -770,16 +799,19 @@ void RecorderImpl::subscribe_topic(const rosbag2_storage::TopicMetadata & topic)
   }
 }
 
-std::shared_ptr<rclcpp::GenericSubscription>
-RecorderImpl::create_subscription(
-  const std::string & topic_name, const std::string & topic_type, const rclcpp::QoS & qos)
+rclcpp::SubscriptionOptions RecorderImpl::subscription_options(const std::string & topic_name)
 {
   rclcpp::SubscriptionOptions sub_options;
   sub_options.event_callbacks.message_lost_callback =
     [this, topic_name](const rclcpp::QOSMessageLostInfo & msgs_lost_info) {
       this->event_notifier_->on_messages_lost_in_transport(topic_name, msgs_lost_info);
     };
+  return sub_options;
+}
 
+DescribedTypeSubscription::Callback RecorderImpl::record_callback(
+  const std::string & topic_name, const std::string & topic_type)
+{
   const auto throttle = topic_throttle_periods_.find(topic_name);
   const int64_t period = throttle == topic_throttle_periods_.end() ? 0 : throttle->second;
   auto write = [this, topic_name, topic_type, period,
@@ -803,30 +835,120 @@ RecorderImpl::create_subscription(
   if (std::string(rmw_get_implementation_identifier()).find("rmw_connextdds") !=
     std::string::npos)
   {
-    return node->create_generic_subscription(
-      topic_name, topic_type, qos,
-      [this, write](std::shared_ptr<const rclcpp::SerializedMessage> message,
-      const rclcpp::MessageInfo &) {
-        write(std::move(message), node->now().nanoseconds(), 0);
-      }, sub_options);
+    return [this, write](std::shared_ptr<const rclcpp::SerializedMessage> message,
+           const rclcpp::MessageInfo &) {
+             write(std::move(message), node->now().nanoseconds(), 0);
+           };
   }
 #endif
   if (record_options_.use_sim_time) {
-    return node->create_generic_subscription(
-      topic_name, topic_type, qos,
-      [this, write](std::shared_ptr<const rclcpp::SerializedMessage> message,
-      const rclcpp::MessageInfo & mi) {
-        write(std::move(message), node->now().nanoseconds(),
-            mi.get_rmw_message_info().source_timestamp);
-      }, sub_options);
+    return [this, write](std::shared_ptr<const rclcpp::SerializedMessage> message,
+           const rclcpp::MessageInfo & mi) {
+             write(std::move(message), node->now().nanoseconds(),
+               mi.get_rmw_message_info().source_timestamp);
+           };
   }
+  return [write](std::shared_ptr<const rclcpp::SerializedMessage> message,
+         const rclcpp::MessageInfo & mi) {
+           write(std::move(message), mi.get_rmw_message_info().received_timestamp,
+             mi.get_rmw_message_info().source_timestamp);
+         };
+}
+
+std::shared_ptr<rclcpp::GenericSubscription>
+RecorderImpl::create_subscription(
+  const std::string & topic_name, const std::string & topic_type, const rclcpp::QoS & qos)
+{
   return node->create_generic_subscription(
-    topic_name, topic_type, qos,
-    [write](std::shared_ptr<const rclcpp::SerializedMessage> message,
-    const rclcpp::MessageInfo & mi) {
-      write(std::move(message), mi.get_rmw_message_info().received_timestamp,
-          mi.get_rmw_message_info().source_timestamp);
-    }, sub_options);
+    topic_name, topic_type, qos, record_callback(topic_name, topic_type),
+    subscription_options(topic_name));
+}
+
+void RecorderImpl::subscribe_described_topic(const rosbag2_storage::TopicMetadata & topic)
+{
+  bool topic_created = false;
+  try {
+    auto [type_support, definition] = describe_type(topic);
+    writer_->create_topic(
+      topic, {topic.type, "ros2msg", definition, topic.type_description_hash});
+    topic_created = true;
+    rosbag2_storage::Rosbag2QoS subscription_qos{subscription_qos_for_topic(topic.name)};
+    auto subscription = std::make_shared<DescribedTypeSubscription>(
+      node->get_node_base_interface().get(), std::move(type_support), topic.name,
+      subscription_qos, record_callback(topic.name, topic.type), subscription_options(topic.name));
+    node->get_node_topics_interface()->add_subscription(subscription, nullptr);
+    subscriptions_.insert({topic.name, subscription});
+    RCLCPP_INFO_STREAM(
+      node->get_logger(),
+      "Subscribed to topic '" << topic.name << "' of type '" << topic.type <<
+        "', which is not installed, with the description of its publisher");
+  } catch (const std::exception & e) {
+    if (topic_created) {
+      writer_->remove_topic(topic);
+    }
+    topic_unknown_types_.insert(topic.name);
+    RCLCPP_WARN_STREAM(
+      node->get_logger(),
+      "Topic '" << topic.name << "' has unknown type '" << topic.type <<
+        "' that its publishers did not describe: " << e.what());
+  }
+}
+
+std::pair<std::shared_ptr<const DescribedTypeSupport>, std::string>
+RecorderImpl::describe_type(const rosbag2_storage::TopicMetadata & topic)
+{
+  using GetTypeDescription = type_description_interfaces::srv::GetTypeDescription;
+  constexpr std::chrono::seconds timeout{2};
+  if (topic.type.find("/msg/") == std::string::npos) {
+    throw std::runtime_error("only message types can be described");
+  }
+  if (topic.type_description_hash.empty()) {
+    throw std::runtime_error("the publishers did not announce a type hash");
+  }
+  if (!type_description_group_) {
+    type_description_group_ =
+      node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
+  }
+  std::string failures;
+  for (const auto & info : node->get_publishers_info_by_topic(topic.name)) {
+    if (info.topic_type() != topic.type) {
+      continue;
+    }
+    const auto & ns = info.node_namespace();
+    const auto service = (ns == "/" ? "" : ns) + "/" + info.node_name() + "/get_type_description";
+    auto client = node->create_client<GetTypeDescription>(
+      service, rclcpp::ServicesQoS(), type_description_group_);
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_callback_group(type_description_group_, node->get_node_base_interface());
+    if (!client->wait_for_service(timeout)) {
+      failures += " " + service + " is not available.";
+      continue;
+    }
+    auto request = std::make_shared<GetTypeDescription::Request>();
+    request->type_name = topic.type;
+    request->type_hash = topic.type_description_hash;
+    request->include_type_sources = true;
+    auto future = client->async_send_request(request);
+    if (executor.spin_until_future_complete(future, timeout) != rclcpp::FutureReturnCode::SUCCESS) {
+      client->remove_pending_request(future);
+      failures += " " + service + " did not answer.";
+      continue;
+    }
+    const auto response = future.get();
+    if (!response->successful) {
+      failures += " " + service + ": " + response->failure_reason;
+      continue;
+    }
+    auto definition = ros2msg_definition(response->type_description, response->type_sources);
+    auto type_support = std::make_shared<const DescribedTypeSupport>(
+      topic.type, definition, topic.type_description_hash);
+    if (type_hash_to_string(type_support->computed_type_hash()) != topic.type_description_hash) {
+      failures += " the description from " + service + " does not match the type hash.";
+      continue;
+    }
+    return {std::move(type_support), std::move(definition)};
+  }
+  throw std::runtime_error(failures.empty() ? "no publisher" : failures.substr(1));
 }
 
 std::vector<rclcpp::QoS> RecorderImpl::offered_qos_profiles_for_topic(

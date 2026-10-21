@@ -19,6 +19,7 @@
 #include <memory>
 #include <string>
 
+#include "rcl/type_description_conversions.h"
 #include "rclcpp/rclcpp.hpp"
 #include "rmw/rmw.h"
 #include "rclcpp/typesupport_helpers.hpp"
@@ -26,6 +27,10 @@
 #include "rosidl_runtime_c/type_hash.h"
 #include "test_msgs/message_fixtures.hpp"
 #include "test_msgs/msg/strings.hpp"
+#include "type_description_interfaces/msg/type_description.h"
+#include "type_description_interfaces/msg/type_description.hpp"
+#include "type_description_interfaces/msg/type_source.h"
+#include "type_description_interfaces/msg/type_source.hpp"
 
 #include "described_type_support.hpp"
 
@@ -50,6 +55,18 @@ std::string hash_string(const rosidl_type_hash_t & hash)
   rcutils_get_default_allocator().deallocate(text, nullptr);
   return result;
 }
+// The C++ message of a C message, through CDR.
+template<typename CppMessage, typename CMessage>
+CppMessage to_cpp(const CMessage * message, const rosidl_message_type_support_t * c_type_support)
+{
+  rclcpp::SerializedMessage serialized;
+  EXPECT_EQ(
+    rmw_serialize(message, c_type_support, &serialized.get_rcl_serialized_message()),
+    RMW_RET_OK);
+  CppMessage result;
+  rclcpp::Serialization<CppMessage>().deserialize_message(&serialized, &result);
+  return result;
+}
 }  // namespace
 
 class DescribedTypeSupportTest : public TestWithParam<std::string> {};
@@ -67,6 +84,43 @@ TEST_P(DescribedTypeSupportTest, hash_matches_generated_type_support)
   EXPECT_EQ(
     hash_string(*handle.get_type_hash_func(&handle)),
     hash_string(*generated->get_type_hash_func(generated)));
+}
+
+TEST_P(DescribedTypeSupportTest, definition_from_a_type_description_keeps_the_hash)
+{
+  const auto type = GetParam();
+  auto library = rclcpp::get_typesupport_library(type, "rosidl_typesupport_cpp");
+  auto generated = rclcpp::get_message_typesupport_handle(type, "rosidl_typesupport_cpp", *library);
+  auto * description_c = rcl_convert_type_description_runtime_to_msg(
+    generated->get_type_description_func(generated));
+  auto * sources_c = rcl_convert_type_source_sequence_runtime_to_msg(
+    generated->get_type_description_sources_func(generated));
+  ASSERT_NE(description_c, nullptr);
+  ASSERT_NE(sources_c, nullptr);
+  const auto description = to_cpp<type_description_interfaces::msg::TypeDescription>(
+    description_c,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(type_description_interfaces, msg, TypeDescription));
+  std::vector<type_description_interfaces::msg::TypeSource> sources;
+  for (size_t i = 0; i < sources_c->size; ++i) {
+    sources.push_back(
+      to_cpp<type_description_interfaces::msg::TypeSource>(
+        &sources_c->data[i],
+        ROSIDL_GET_MSG_TYPE_SUPPORT(type_description_interfaces, msg, TypeSource)));
+  }
+  type_description_interfaces__msg__TypeDescription__destroy(description_c);
+  type_description_interfaces__msg__TypeSource__Sequence__destroy(sources_c);
+  const auto expected = hash_string(*generated->get_type_hash_func(generated));
+
+  const auto from_sources = rosbag2_transport::ros2msg_definition(description, sources);
+  EXPECT_EQ(
+    hash_string(
+      rosbag2_transport::DescribedTypeSupport(type, from_sources).computed_type_hash()),
+    expected) << from_sources;
+  const auto from_fields = rosbag2_transport::ros2msg_definition(description, {});
+  EXPECT_EQ(
+    hash_string(
+      rosbag2_transport::DescribedTypeSupport(type, from_fields).computed_type_hash()),
+    expected) << from_fields;
 }
 
 INSTANTIATE_TEST_SUITE_P(

@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "rcl/intra_process.h"
 #include "rcl/publisher.h"
 #include "rcl/type_description_conversions.h"
 #include "rcl/type_hash.h"
@@ -38,6 +39,7 @@
 #include "rosidl_runtime_c/type_description/type_source__functions.h"
 #include "rosidl_typesupport_fastrtps_cpp/identifier.hpp"
 #include "rosidl_typesupport_fastrtps_cpp/message_type_support.h"
+#include "type_description_interfaces/msg/field_type.hpp"
 #include "type_description_interfaces/msg/type_description.h"
 
 namespace rosbag2_transport
@@ -223,7 +225,92 @@ void fill(
   }
 }
 
+std::string msg_type_name(const std::string & type)
+{
+  return type.substr(0, type.find('/')) + "/" + type.substr(type.rfind('/') + 1);
+}
+
+std::string msg_fields(const type_description_interfaces::msg::IndividualTypeDescription & type)
+{
+  using FieldType = type_description_interfaces::msg::FieldType;
+  static const std::map<uint8_t, std::string> names = {
+    {FieldType::FIELD_TYPE_INT8, "int8"}, {FieldType::FIELD_TYPE_UINT8, "uint8"},
+    {FieldType::FIELD_TYPE_INT16, "int16"}, {FieldType::FIELD_TYPE_UINT16, "uint16"},
+    {FieldType::FIELD_TYPE_INT32, "int32"}, {FieldType::FIELD_TYPE_UINT32, "uint32"},
+    {FieldType::FIELD_TYPE_INT64, "int64"}, {FieldType::FIELD_TYPE_UINT64, "uint64"},
+    {FieldType::FIELD_TYPE_FLOAT, "float32"}, {FieldType::FIELD_TYPE_DOUBLE, "float64"},
+    {FieldType::FIELD_TYPE_BOOLEAN, "bool"}, {FieldType::FIELD_TYPE_BYTE, "byte"},
+    {FieldType::FIELD_TYPE_STRING, "string"}, {FieldType::FIELD_TYPE_WSTRING, "wstring"},
+    {FieldType::FIELD_TYPE_BOUNDED_STRING, "string"},
+    {FieldType::FIELD_TYPE_BOUNDED_WSTRING, "wstring"},
+  };
+  constexpr uint8_t kinds = 48;
+  std::string text;
+  for (const auto & field : type.fields) {
+    const uint8_t base = field.type.type_id % kinds;
+    std::string type_name;
+    if (base == FieldType::FIELD_TYPE_NESTED_TYPE) {
+      type_name = msg_type_name(field.type.nested_type_name);
+    } else {
+      const auto name = names.find(base);
+      if (name == names.end()) {
+        throw std::runtime_error(
+                "field " + field.name + " of " + type.type_name + " has type id " +
+                std::to_string(field.type.type_id) + ", which .msg cannot express");
+      }
+      type_name = name->second;
+    }
+    if (base == FieldType::FIELD_TYPE_BOUNDED_STRING ||
+      base == FieldType::FIELD_TYPE_BOUNDED_WSTRING)
+    {
+      type_name += "<=" + std::to_string(field.type.string_capacity);
+    }
+    switch (field.type.type_id / kinds) {
+      case 1:
+        type_name += "[" + std::to_string(field.type.capacity) + "]";
+        break;
+      case 2:
+        type_name += "[<=" + std::to_string(field.type.capacity) + "]";
+        break;
+      case 3:
+        type_name += "[]";
+        break;
+    }
+    text += type_name + " " + field.name + "\n";
+  }
+  return text;
+}
+
 }  // namespace
+
+std::string ros2msg_definition(
+  const type_description_interfaces::msg::TypeDescription & description,
+  const std::vector<type_description_interfaces::msg::TypeSource> & sources)
+{
+  std::map<std::string, std::string> msg_sources;
+  for (const auto & source : sources) {
+    if (source.encoding == "msg" && !source.raw_file_contents.empty()) {
+      msg_sources.emplace(source.type_name, source.raw_file_contents);
+    }
+  }
+  auto text_of = [&msg_sources](const auto & type) {
+      const auto source = msg_sources.find(type.type_name);
+      if (source == msg_sources.end()) {
+        return msg_fields(type);
+      }
+      auto text = source->second;
+      if (text.back() != '\n') {
+        text += '\n';
+      }
+      return text;
+    };
+  std::string text = text_of(description.type_description);
+  for (const auto & referenced : description.referenced_type_descriptions) {
+    text += "\n" + std::string(80, '=') + "\nMSG: " + msg_type_name(referenced.type_name) + "\n" +
+      text_of(referenced);
+  }
+  return text;
+}
 
 struct DescribedTypeSupport::Impl
 {
@@ -384,6 +471,101 @@ void DescribedTypePublisher::publish(const rclcpp::SerializedMessage & message)
   if (ret != RCL_RET_OK) {
     rclcpp::exceptions::throw_from_rcl_error(ret, "failed to publish serialized message");
   }
+}
+
+DescribedTypeSubscription::DescribedTypeSubscription(
+  rclcpp::node_interfaces::NodeBaseInterface * node_base,
+  std::shared_ptr<const DescribedTypeSupport> type_support,
+  const std::string & topic_name,
+  const rclcpp::QoS & qos,
+  Callback callback,
+  const rclcpp::SubscriptionOptions & options)
+: rclcpp::SubscriptionBase(
+    node_base, type_support->type_support(), topic_name,
+    options.to_rcl_subscription_options(qos), options.event_callbacks,
+    options.use_default_callbacks, rclcpp::DeliveredMessageKind::SERIALIZED_MESSAGE),
+  type_support_(std::move(type_support)),
+  callback_(std::move(callback))
+{
+  if (options.use_intra_process_comm == rclcpp::IntraProcessSetting::Disable) {
+    rcl_subscription_disable_ipc(get_subscription_handle().get());
+  } else {
+    rcl_subscription_set_serialized_ipc(get_subscription_handle().get());
+  }
+}
+
+std::shared_ptr<void> DescribedTypeSubscription::create_message()
+{
+  return create_serialized_message();
+}
+
+std::shared_ptr<rclcpp::SerializedMessage> DescribedTypeSubscription::create_serialized_message()
+{
+  return std::make_shared<rclcpp::SerializedMessage>(0);
+}
+
+void DescribedTypeSubscription::handle_message(std::shared_ptr<void> &, const rclcpp::MessageInfo &)
+{
+  throw rclcpp::exceptions::UnimplementedError("only serialized messages are taken");
+}
+
+void DescribedTypeSubscription::handle_serialized_message(
+  const std::shared_ptr<rclcpp::SerializedMessage> & message,
+  const rclcpp::MessageInfo & message_info)
+{
+  callback_(message, message_info);
+}
+
+void DescribedTypeSubscription::handle_loaned_message(void *, const rclcpp::MessageInfo &)
+{
+  throw rclcpp::exceptions::UnimplementedError("only serialized messages are taken");
+}
+
+void DescribedTypeSubscription::return_message(std::shared_ptr<void> & message)
+{
+  message.reset();
+}
+
+void DescribedTypeSubscription::return_serialized_message(
+  std::shared_ptr<rclcpp::SerializedMessage> & message)
+{
+  message.reset();
+}
+
+rclcpp::dynamic_typesupport::DynamicMessageType::SharedPtr
+DescribedTypeSubscription::get_shared_dynamic_message_type()
+{
+  throw rclcpp::exceptions::UnimplementedError("only serialized messages are taken");
+}
+
+rclcpp::dynamic_typesupport::DynamicMessage::SharedPtr
+DescribedTypeSubscription::get_shared_dynamic_message()
+{
+  throw rclcpp::exceptions::UnimplementedError("only serialized messages are taken");
+}
+
+rclcpp::dynamic_typesupport::DynamicSerializationSupport::SharedPtr
+DescribedTypeSubscription::get_shared_dynamic_serialization_support()
+{
+  throw rclcpp::exceptions::UnimplementedError("only serialized messages are taken");
+}
+
+rclcpp::dynamic_typesupport::DynamicMessage::SharedPtr
+DescribedTypeSubscription::create_dynamic_message()
+{
+  throw rclcpp::exceptions::UnimplementedError("only serialized messages are taken");
+}
+
+void DescribedTypeSubscription::return_dynamic_message(
+  rclcpp::dynamic_typesupport::DynamicMessage::SharedPtr &)
+{
+  throw rclcpp::exceptions::UnimplementedError("only serialized messages are taken");
+}
+
+void DescribedTypeSubscription::handle_dynamic_message(
+  const rclcpp::dynamic_typesupport::DynamicMessage::SharedPtr &, const rclcpp::MessageInfo &)
+{
+  throw rclcpp::exceptions::UnimplementedError("only serialized messages are taken");
 }
 
 }  // namespace rosbag2_transport

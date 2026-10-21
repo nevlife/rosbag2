@@ -18,11 +18,15 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "rclcpp/rclcpp.hpp"
+#include "rmw/rmw.h"
+
+#include "rosbag2_cpp/message_definitions/local_message_definition_source.hpp"
 
 #include "rosbag2_test_common/publication_manager.hpp"
 #include "rosbag2_test_common/wait_for.hpp"
@@ -31,9 +35,11 @@
 
 #include "test_msgs/msg/arrays.hpp"
 #include "test_msgs/msg/basic_types.hpp"
+#include "test_msgs/msg/strings.hpp"
 #include "test_msgs/message_fixtures.hpp"
 
 #include "rosbag2_storage/qos.hpp"
+#include "described_type_support.hpp"
 #include "record_integration_fixture.hpp"
 
 TEST_F(RecordIntegrationTestFixture, published_messages_from_multiple_topics_are_recorded)
@@ -124,6 +130,69 @@ TEST_F(RecordIntegrationTestFixture, published_messages_from_multiple_topics_are
       EXPECT_EQ(message->send_timestamp, 0);
     }
   }
+}
+
+TEST_F(RecordIntegrationTestFixture, records_a_type_that_is_not_installed_from_its_description)
+{
+  if (std::string(rmw_get_implementation_identifier()) != "rmw_zenoh_cpp") {
+    GTEST_SKIP() << "Only rmw_zenoh_cpp takes a type support without generated code";
+  }
+  // No package provides this type; its publisher describes it with the fields of
+  // test_msgs/msg/Strings.
+  const std::string type = "rosbag2_absent_msgs/msg/Strings";
+  const std::string topic = "/absent_type_topic";
+  auto type_support = std::make_shared<const rosbag2_transport::DescribedTypeSupport>(
+    type, rosbag2_cpp::LocalMessageDefinitionSource().get_full_text(
+      "test_msgs/msg/Strings").encoded_message_definition);
+  auto publisher_node = std::make_shared<rclcpp::Node>("absent_type_publisher");
+  auto publisher = std::make_shared<rosbag2_transport::DescribedTypePublisher>(
+    publisher_node->get_node_base_interface().get(), type_support, topic, rclcpp::QoS(10));
+  rclcpp::executors::SingleThreadedExecutor publisher_executor;
+  publisher_executor.add_node(publisher_node);
+  std::thread publisher_spin([&publisher_executor]() {publisher_executor.spin();});
+  auto stop_publisher_spin = rcpputils::make_scope_exit(
+    [&]() {
+      publisher_executor.cancel();
+      publisher_spin.join();
+    });
+
+  auto message = get_messages_strings()[1];
+  rclcpp::Serialization<test_msgs::msg::Strings> serialization;
+  rclcpp::SerializedMessage serialized;
+  serialization.serialize_message(message.get(), &serialized);
+
+  rosbag2_transport::RecordOptions record_options =
+  {false, false, false, {topic}, {}, {}, {}, {}, {}, "rmw_format", 50ms};
+  auto recorder = std::make_shared<rosbag2_transport::Recorder>(
+    std::move(writer_), storage_options_, record_options);
+  recorder->record();
+  start_async_spin(recorder);
+  auto cleanup_process_handle = rcpputils::make_scope_exit([&]() {stop_spinning();});
+
+  auto & writer = recorder->get_writer_handle();
+  MockSequentialWriter & mock_writer =
+    static_cast<MockSequentialWriter &>(writer.get_implementation_handle());
+  auto recorded = rosbag2_test_common::wait_until_condition(
+    [&]() {
+      publisher->publish(serialized);
+      return mock_writer.get_messages_per_topic(topic) >= 2;
+    },
+    std::chrono::seconds(10));
+  ASSERT_TRUE(recorded);
+
+  auto recorded_messages = filter_messages<test_msgs::msg::Strings>(
+    mock_writer.get_messages(), topic);
+  EXPECT_THAT(recorded_messages, Each(Pointee(Eq(*message))));
+  const auto topics = mock_writer.get_topics();
+  const auto & [metadata, definition] = topics.at(topic);
+  EXPECT_EQ(metadata.type, type);
+  EXPECT_EQ(definition.topic_type, type);
+  EXPECT_EQ(definition.encoding, "ros2msg");
+  const auto hash = rosbag2_transport::type_hash_to_string(type_support->computed_type_hash());
+  EXPECT_EQ(metadata.type_description_hash, hash);
+  rosbag2_transport::DescribedTypeSupport recorded_type(
+    type, definition.encoded_message_definition);
+  EXPECT_EQ(rosbag2_transport::type_hash_to_string(recorded_type.computed_type_hash()), hash);
 }
 
 TEST_F(RecordIntegrationTestFixture, can_record_again_after_stop)
