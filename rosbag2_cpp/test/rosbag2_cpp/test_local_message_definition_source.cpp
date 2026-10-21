@@ -62,6 +62,22 @@ TEST(test_local_message_definition_source, can_find_msg_deps)
     "float32 c\n");
 }
 
+TEST(test_local_message_definition_source, can_find_msg_deps_next_to_wstrings)
+{
+  LocalMessageDefinitionSource source;
+  auto result = source.get_full_text("rosbag2_test_msgdefs/msg/WStringMsg");
+  ASSERT_EQ(result.encoding, "ros2msg");
+  ASSERT_EQ(
+    result.encoded_message_definition,
+    "wstring w\n"
+    "wstring<=4 bounded\n"
+    "BasicMsg b\n"
+    "\n"
+    "================================================================================\n"
+    "MSG: rosbag2_test_msgdefs/BasicMsg\n"
+    "float32 c\n");
+}
+
 TEST(test_local_message_definition_source, can_find_msg_definition_in_nested_subfolder)
 {
   LocalMessageDefinitionSource source;
