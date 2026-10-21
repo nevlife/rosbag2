@@ -95,7 +95,12 @@ public:
   void get_all_message_definitions(std::vector<rosbag2_storage::MessageDefinition> & definitions)
   override
   {
-    definitions.clear();
+    definitions = message_definitions_;
+  }
+
+  void set_message_definitions(std::vector<rosbag2_storage::MessageDefinition> definitions)
+  {
+    message_definitions_ = std::move(definitions);
   }
 
   void set_filter(const rosbag2_storage::StorageFilter & storage_filter) override
@@ -155,6 +160,7 @@ private:
   std::vector<std::shared_ptr<rosbag2_storage::SerializedBagMessage>> messages_;
   rosbag2_storage::BagMetadata metadata_;
   std::vector<rosbag2_storage::TopicMetadata> topics_;
+  std::vector<rosbag2_storage::MessageDefinition> message_definitions_;
   size_t num_read_;
   rcutils_time_point_value_t seek_time_ = 0;
   rosbag2_storage::StorageFilter filter_;

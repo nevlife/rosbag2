@@ -73,6 +73,11 @@ ReadersManager::get_all_topics_and_types() const
   return pimpl_->get_all_topics_and_types();
 }
 
+std::vector<rosbag2_storage::MessageDefinition> ReadersManager::get_all_message_definitions()
+{
+  return pimpl_->get_all_message_definitions();
+}
+
 void ReadersManager::add_event_callbacks(rosbag2_cpp::bag_events::ReaderEventCallbacks & callbacks)
 {
   pimpl_->add_event_callbacks(callbacks);

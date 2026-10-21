@@ -15,22 +15,29 @@
 #include <gmock/gmock.h>
 
 #include <chrono>
+#include <cstring>
 #include <future>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 #include <unordered_map>
 #include <utility>
 
 #include "rcutils/time.h"
 #include "rclcpp/rclcpp.hpp"
+#include "rmw/rmw.h"
 
 #include "rosbag2_test_common/subscription_manager.hpp"
 #include "rosbag2_test_common/service_manager.hpp"
 
 #include "rosbag2_transport/player.hpp"
 
+#include "rcl/subscription.h"
+#include "rosbag2_cpp/message_definitions/local_message_definition_source.hpp"
+#include "described_type_support.hpp"
 #include "test_msgs/msg/arrays.hpp"
+#include "test_msgs/msg/strings.hpp"
 #include "test_msgs/msg/basic_types.hpp"
 #include "test_msgs/message_fixtures.hpp"
 #include "test_msgs/srv/basic_types.hpp"
@@ -173,6 +180,71 @@ TEST_F(RosBag2PlayTestFixture, recorded_messages_are_played_for_all_topics)
         Field(
           &test_msgs::msg::Arrays::float32_values,
           ElementsAre(40.0f, 2.0f, 0.0f)))));
+}
+
+TEST_F(RosBag2PlayTestFixture, plays_a_type_known_only_from_the_definition_in_the_bag)
+{
+  if (std::string(rmw_get_implementation_identifier()) != "rmw_zenoh_cpp") {
+    GTEST_SKIP() << "Only rmw_zenoh_cpp takes a type support without generated code";
+  }
+  // No package provides this type; its stored definition is that of test_msgs/msg/Strings.
+  const std::string type = "rosbag2_absent_msgs/msg/Strings";
+  auto definition = rosbag2_cpp::LocalMessageDefinitionSource().get_full_text(
+    "test_msgs/msg/Strings");
+  definition.topic_type = type;
+  auto message = get_messages_strings()[1];
+  std::vector<std::shared_ptr<rosbag2_storage::SerializedBagMessage>> messages = {
+    serialize_test_message("topic1", 500, message),
+    serialize_test_message("topic1", 600, message)};
+  auto prepared_mock_reader = std::make_unique<MockSequentialReader>();
+  prepared_mock_reader->prepare(messages, {{1u, "topic1", type, "", {}, ""}});
+  prepared_mock_reader->set_message_definitions({definition});
+  auto reader = std::make_unique<rosbag2_cpp::Reader>(std::move(prepared_mock_reader));
+
+  auto player = std::make_shared<rosbag2_transport::Player>(
+    std::move(reader), storage_options_, play_options_);
+
+  // A subscriber without the type's packages takes serialized messages through rcl.
+  auto node = std::make_shared<rclcpp::Node>("absent_type_subscriber");
+  rosbag2_transport::DescribedTypeSupport type_support(
+    type, definition.encoded_message_definition);
+  rcl_subscription_t subscription = rcl_get_zero_initialized_subscription();
+  auto options = rcl_subscription_get_default_options();
+  options.qos.depth = 10;
+  ASSERT_EQ(
+    rcl_subscription_init(
+      &subscription, node->get_node_base_interface()->get_rcl_node_handle(),
+      &type_support.type_support(), "/topic1", &options), RCL_RET_OK);
+  size_t publishers = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (publishers == 0 && std::chrono::steady_clock::now() < deadline) {
+    ASSERT_EQ(rcl_subscription_get_publisher_count(&subscription, &publishers), RCL_RET_OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_EQ(publishers, 1u);
+
+  player->play();
+  player->wait_for_playback_to_finish();
+
+  size_t taken = 0;
+  rclcpp::SerializedMessage received;
+  while (taken < messages.size() && std::chrono::steady_clock::now() < deadline) {
+    if (rcl_take_serialized_message(
+        &subscription, &received.get_rcl_serialized_message(), nullptr, nullptr) == RCL_RET_OK)
+    {
+      const auto & sent = *messages[taken]->serialized_data;
+      ASSERT_EQ(received.size(), sent.buffer_length);
+      EXPECT_EQ(std::memcmp(received.get_rcl_serialized_message().buffer, sent.buffer,
+        sent.buffer_length), 0);
+      ++taken;
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  EXPECT_EQ(taken, messages.size());
+  EXPECT_EQ(
+    rcl_subscription_fini(&subscription, node->get_node_base_interface()->get_rcl_node_handle()),
+    RCL_RET_OK);
 }
 
 TEST_F(RosBag2PlayTestFixture, can_play_messages_with_queue_size_equal_one)

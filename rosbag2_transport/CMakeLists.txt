@@ -39,11 +39,15 @@ find_package(rosbag2_cpp REQUIRED)
 find_package(rosbag2_interfaces REQUIRED)
 find_package(rosbag2_storage REQUIRED)
 find_package(rmw_implementation_cmake REQUIRED)
+find_package(rosidl_runtime_c REQUIRED)
+find_package(rosidl_typesupport_fastrtps_cpp REQUIRED)
+find_package(type_description_interfaces REQUIRED)
 find_package(yaml_cpp_vendor REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 add_library(${PROJECT_NAME} SHARED
   src/rosbag2_transport/bag_rewrite.cpp
+  src/rosbag2_transport/described_type_support.cpp
   src/rosbag2_transport/recorder_event_notifier.cpp
   src/rosbag2_transport/player.cpp
   src/rosbag2_transport/play_options.cpp
@@ -71,6 +75,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
   rcutils::rcutils
   rmw::rmw
   rosbag2_compression::rosbag2_compression
+  rosidl_runtime_c::rosidl_runtime_c
+  rosidl_typesupport_fastrtps_cpp::rosidl_typesupport_fastrtps_cpp
+  ${type_description_interfaces_TARGETS}
   yaml-cpp::yaml-cpp
 )
 
@@ -151,6 +158,15 @@ if(BUILD_TESTING)
     )
   endfunction()
   call_for_each_rmw_implementation(test_play_for_rmw_implementation)
+  target_include_directories(test_play PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/rosbag2_transport>)
+
+  ament_add_gmock(test_described_type_support
+    test/rosbag2_transport/test_described_type_support.cpp)
+  target_include_directories(test_described_type_support PRIVATE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/rosbag2_transport>)
+  target_link_libraries(test_described_type_support
+    rosbag2_transport ${test_msgs_TARGETS} ${type_description_interfaces_TARGETS} rcl::rcl rmw::rmw)
 
   ament_add_gmock_executable(test_composable_player test/rosbag2_transport/test_composable_player.cpp)
   target_link_libraries(test_composable_player

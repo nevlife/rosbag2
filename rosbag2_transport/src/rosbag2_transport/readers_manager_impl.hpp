@@ -175,6 +175,18 @@ public:
     return all_topics_and_types;
   }
 
+  [[nodiscard]] std::vector<rosbag2_storage::MessageDefinition> get_all_message_definitions()
+  {
+    std::vector<rosbag2_storage::MessageDefinition> all_definitions{};
+    rcpputils::unique_lock lk(reader_mutex_);
+    for (const auto & [reader, _] : readers_with_options_) {
+      std::vector<rosbag2_storage::MessageDefinition> definitions;
+      reader->get_all_message_definitions(definitions);
+      all_definitions.insert(all_definitions.end(), definitions.begin(), definitions.end());
+    }
+    return all_definitions;
+  }
+
   void add_event_callbacks(rosbag2_cpp::bag_events::ReaderEventCallbacks & callbacks)
   {
     rcpputils::unique_lock lk(reader_mutex_);

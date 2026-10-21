@@ -22,6 +22,7 @@
 #include "rcutils/time.h"
 #include "rosbag2_cpp/bag_events.hpp"
 #include "rosbag2_cpp/reader.hpp"
+#include "rosbag2_storage/message_definition.hpp"
 #include "rosbag2_storage/serialized_bag_message.hpp"
 #include "rosbag2_storage/storage_options.hpp"
 #include "rosbag2_transport/visibility_control.hpp"
@@ -114,6 +115,10 @@ public:
   /// \brief Getter for all topics and types in all readers.
   /// \return vector of topics with topic name and type as std::string
   [[nodiscard]] std::vector<rosbag2_storage::TopicMetadata> get_all_topics_and_types() const;
+
+  /// \brief Getter for the message definitions stored in all readers.
+  /// \return Definitions in reader order; a type may appear once per reader.
+  [[nodiscard]] std::vector<rosbag2_storage::MessageDefinition> get_all_message_definitions();
 
   /// \brief Add event callbacks to all readers.
   /// \param callbacks The callbacks to add.
