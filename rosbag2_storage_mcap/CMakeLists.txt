@@ -109,6 +109,7 @@ if(BUILD_TESTING)
     rosbag2_test_common::rosbag2_test_common
     ${std_msgs_TARGETS}
     yaml-cpp::yaml-cpp
+    mcap_vendor::mcap
   )
   target_compile_definitions(test_mcap_storage PRIVATE ${MCAP_COMPILE_DEFS})
 

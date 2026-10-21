@@ -58,6 +58,8 @@ To configure details of the MCAP writer for `ros2 bag record`, use the `--storag
 | noChunkIndex | bool | Advanced option. |
 | noStatistics | bool | Advanced option. |
 | noSummaryOffsets | bool | Advanced option. |
+| chunkByTopic | bool | rosbag2 option. Give each topic its own Chunks, so a reader of a few topics reads and decompresses only their Chunks. Messages are buffered per topic until the topic's Chunk reaches `chunkSize`, its oldest message is `chunkByTopicMaxDelayMs` older than the newest message written, or the file closes. Chunks of different topics overlap in time, so file order is no longer log time order. Ignored if `noChunking=true`. |
+| chunkByTopicMaxDelayMs | unsigned int | Longest log time span a buffered topic Chunk may cover with `chunkByTopic=true`. Default 1000. |
 
 
 Example:

@@ -22,6 +22,8 @@
 #include "rosbag2_test_common/temporary_directory_fixture.hpp"
 #include "std_msgs/msg/string.hpp"
 
+#include <mcap/reader.hpp>
+
 #include <gmock/gmock.h>
 
 #include <filesystem>
@@ -404,6 +406,82 @@ TEST_F(McapStorageTestFixture, retained_messages_survive_read_seek_close_and_res
         serialization.deserialize_message(&copied, &decoded);
         EXPECT_EQ(decoded.data.size(), 1048576u);
       }
+    }
+  }
+}
+
+TEST_F(McapStorageTestFixture, chunk_by_topic_writes_one_topic_per_chunk)
+{
+  constexpr int64_t ms = 1000000;
+  for (const std::string compression : {"None", "Lz4"}) {
+    for (bool by_topic : {false, true}) {
+      SCOPED_TRACE(compression);
+      SCOPED_TRACE(by_topic);
+      auto config_path = std::filesystem::path(temporary_dir_path_) / "writer.yaml";
+      std::ofstream(config_path) << "chunkSize: 4096\nchunkByTopicMaxDelayMs: 50\n"
+                                 << "compression: " << compression << "\n"
+                                 << "chunkByTopic: " << (by_topic ? "true" : "false") << "\n";
+      rosbag2_storage::StorageOptions options;
+      options.uri =
+        (std::filesystem::path(temporary_dir_path_) / (compression + std::to_string(by_topic)))
+          .string();
+      options.storage_id = "mcap";
+      options.storage_config_uri = config_path.string();
+      rosbag2_storage::StorageFactory factory;
+      std::vector<std::pair<std::string, int64_t>> written;
+      {
+        auto writer = factory.open_read_write(options);
+        ASSERT_NE(writer, nullptr);
+        for (const std::string topic : {"fast", "slow"}) {
+          writer->create_topic({0, topic, "std_msgs/msg/String", "cdr", {}, ""},
+                               {"std_msgs/msg/String", "ros2msg", "string data", ""});
+        }
+        for (int64_t i = 0; i < 300; ++i) {
+          std::string topic = i % 10 == 0 ? "slow" : "fast";
+          auto message = std::make_shared<rosbag2_storage::SerializedBagMessage>();
+          message->topic_name = topic;
+          message->recv_timestamp = (1000 + i) * ms;
+          message->send_timestamp = message->recv_timestamp;
+          auto data = topic + std::to_string(i) + std::string(i % 10 == 0 ? 50 : 200, 'x');
+          message->serialized_data = make_serialized_message(data);
+          writer->write(message);
+          written.emplace_back(data, message->recv_timestamp);
+        }
+      }
+
+      mcap::McapReader mcap_reader;
+      ASSERT_TRUE(mcap_reader.open(options.uri + ".mcap").ok());
+      ASSERT_TRUE(mcap_reader.readSummary(mcap::ReadSummaryMethod::NoFallbackScan).ok());
+      size_t mixed_chunks = 0;
+      for (const auto & chunk : mcap_reader.chunkIndexes()) {
+        mixed_chunks += chunk.messageIndexOffsets.size() > 1;
+        if (by_topic) {
+          EXPECT_LT(chunk.messageEndTime - chunk.messageStartTime, 50u * ms);
+        }
+      }
+      EXPECT_GT(mcap_reader.chunkIndexes().size(), 2u);
+      if (by_topic) {
+        EXPECT_EQ(mixed_chunks, 0u);
+      } else {
+        EXPECT_GT(mixed_chunks, 0u);
+      }
+      mcap_reader.close();
+
+      options.uri += ".mcap";
+      options.storage_config_uri.clear();
+      auto reader = factory.open_read_only(options);
+      ASSERT_TRUE(reader->set_read_order({rosbag2_storage::ReadOrder::ReceivedTimestamp, false}));
+      rclcpp::Serialization<std_msgs::msg::String> serialization;
+      std::vector<std::pair<std::string, int64_t>> read;
+      while (reader->has_next()) {
+        auto message = reader->read_next();
+        rclcpp::SerializedMessage serialized(*message->serialized_data);
+        std_msgs::msg::String decoded;
+        serialization.deserialize_message(&serialized, &decoded);
+        read.emplace_back(decoded.data, message->recv_timestamp);
+      }
+      EXPECT_EQ(read, written);
+      EXPECT_EQ(reader->get_metadata().message_count, written.size());
     }
   }
 }

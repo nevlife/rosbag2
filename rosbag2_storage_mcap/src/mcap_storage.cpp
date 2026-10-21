@@ -43,6 +43,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -98,6 +99,9 @@ struct McapWriterOptions : mcap::McapWriterOptions
       : mcap::McapWriterOptions("ros2")
   {
   }
+
+  bool chunkByTopic = false;
+  uint64_t chunkByTopicMaxDelayMs = 1000;
 };
 
 struct SharedMessage
@@ -229,6 +233,8 @@ struct convert<McapWriterOptions>
     optional_assign<bool>(node, "noChunkIndex", o.noChunkIndex);
     optional_assign<bool>(node, "noStatistics", o.noStatistics);
     optional_assign<bool>(node, "noSummaryOffsets", o.noSummaryOffsets);
+    optional_assign<bool>(node, "chunkByTopic", o.chunkByTopic);
+    optional_assign<uint64_t>(node, "chunkByTopicMaxDelayMs", o.chunkByTopicMaxDelayMs);
     return true;
   }
 };
@@ -311,6 +317,25 @@ public:
 private:
   void read_metadata();
   void write_lock_free(std::shared_ptr<const rosbag2_storage::SerializedBagMessage> msg);
+  void write_message(mcap::ChannelId channel_id, rcutils_time_point_value_t log_time,
+                     rcutils_time_point_value_t publish_time, const uint8_t * data, size_t size);
+
+  struct BufferedMessage
+  {
+    rcutils_time_point_value_t log_time;
+    rcutils_time_point_value_t publish_time;
+    std::vector<uint8_t> data;
+  };
+  struct TopicChunk
+  {
+    std::vector<BufferedMessage> messages;
+    uint64_t size = 0;
+    rcutils_time_point_value_t first_time = 0;
+  };
+  void buffer_message(mcap::ChannelId channel_id,
+                      const rosbag2_storage::SerializedBagMessage & msg);
+  void flush_topic_chunk(mcap::ChannelId channel_id, TopicChunk & chunk);
+  void flush_topic_chunks(rcutils_time_point_value_t older_than);
   void open_impl(const std::string & uri, const std::string & preset_profile,
                  rosbag2_storage::storage_interfaces::IOFlag io_flag,
                  const std::string & storage_config_uri);
@@ -373,6 +398,12 @@ private:
   std::unique_ptr<mcap::LinearMessageView::Iterator> linear_iterator_;
 
   std::unique_ptr<mcap::McapWriter> mcap_writer_;
+  bool chunk_by_topic_ = false;
+  uint64_t chunk_size_ = 0;
+  rcutils_duration_value_t chunk_max_delay_ = 0;
+  rcutils_time_point_value_t oldest_buffered_time_ =
+    std::numeric_limits<rcutils_time_point_value_t>::max();
+  std::unordered_map<mcap::ChannelId, TopicChunk> topic_chunks_;
 
   bool has_read_summary_ = false;
   rcutils_time_point_value_t last_read_time_point_ = 0;
@@ -395,6 +426,11 @@ MCAPStorage::~MCAPStorage()
     input_->close();
   }
   if (mcap_writer_) {
+    try {
+      flush_topic_chunks(std::numeric_limits<rcutils_time_point_value_t>::max());
+    } catch (const std::exception & e) {
+      RCUTILS_LOG_ERROR_NAMED(LOG_NAME, "Failed to write buffered topic chunks: %s", e.what());
+    }
     mcap_writer_->close();
   }
 }
@@ -484,6 +520,10 @@ void MCAPStorage::open_impl(const std::string & uri, const std::string & preset_
       if (!status.ok()) {
         throw std::runtime_error(status.message);
       }
+      chunk_by_topic_ = options.chunkByTopic && !options.noChunking;
+      chunk_size_ = options.chunkSize;
+      chunk_max_delay_ =
+        static_cast<rcutils_duration_value_t>(options.chunkByTopicMaxDelayMs) * 1000000;
       break;
     }
   }
@@ -950,21 +990,15 @@ void MCAPStorage::write_lock_free(std::shared_ptr<const rosbag2_storage::Seriali
     throw std::runtime_error{"Channel reference not found for topic: \"" + msg->topic_name + "\""};
   }
 
-  mcap::Message mcap_msg;
-  mcap_msg.channelId = channel_it->second;
-  mcap_msg.sequence = 0;
   if (msg->recv_timestamp < 0) {
     RCUTILS_LOG_WARN_NAMED(LOG_NAME, "Invalid message timestamp %ld", msg->recv_timestamp);
   }
-  mcap_msg.logTime = mcap::Timestamp(msg->recv_timestamp);
-  mcap_msg.publishTime = mcap::Timestamp(msg->send_timestamp);
-  mcap_msg.dataSize = msg->serialized_data->buffer_length;
-  mcap_msg.data = reinterpret_cast<const std::byte *>(msg->serialized_data->buffer);
-  const auto status = mcap_writer_->write(mcap_msg);
-  if (!status.ok()) {
-    throw std::runtime_error{std::string{"Failed to write "} +
-                             std::to_string(msg->serialized_data->buffer_length) +
-                             " byte message to MCAP file: " + status.message};
+  const auto message_time = time_point(std::chrono::nanoseconds(msg->recv_timestamp));
+  if (chunk_by_topic_) {
+    buffer_message(channel_it->second, *msg);
+  } else {
+    write_message(channel_it->second, msg->recv_timestamp, msg->send_timestamp,
+                  msg->serialized_data->buffer, msg->serialized_data->buffer_length);
   }
 
   /// Update metadata
@@ -973,8 +1007,86 @@ void MCAPStorage::write_lock_free(std::shared_ptr<const rosbag2_storage::Seriali
   // Increment global message count
   metadata_.message_count++;
   // Determine recording duration
-  const auto message_time = time_point(std::chrono::nanoseconds(msg->recv_timestamp));
   metadata_.duration = std::max(metadata_.duration, message_time - metadata_.starting_time);
+}
+
+void MCAPStorage::write_message(mcap::ChannelId channel_id, rcutils_time_point_value_t log_time,
+                                rcutils_time_point_value_t publish_time, const uint8_t * data,
+                                size_t size)
+{
+  mcap::Message mcap_msg;
+  mcap_msg.channelId = channel_id;
+  mcap_msg.sequence = 0;
+  mcap_msg.logTime = mcap::Timestamp(log_time);
+  mcap_msg.publishTime = mcap::Timestamp(publish_time);
+  mcap_msg.dataSize = size;
+  mcap_msg.data = reinterpret_cast<const std::byte *>(data);
+  const auto status = mcap_writer_->write(mcap_msg);
+  if (!status.ok()) {
+    throw std::runtime_error{std::string{"Failed to write "} + std::to_string(size) +
+                             " byte message to MCAP file: " + status.message};
+  }
+}
+
+// Each topic fills its own chunk, so a reader of one topic skips the chunks of the others.
+// The buffered messages are written when their chunk is full, when the topic's oldest buffered
+// message is older than the max delay in log time, or on close. Buffered messages are copies:
+// a message may share its buffer with others, as a read chunk does.
+// A message that fills a chunk alone is written without buffering.
+void MCAPStorage::buffer_message(mcap::ChannelId channel_id,
+                                 const rosbag2_storage::SerializedBagMessage & msg)
+{
+  constexpr uint64_t message_record_overhead = 9 + 2 + 4 + 8 + 8;
+  const auto time = msg.recv_timestamp;
+  if (oldest_buffered_time_ <= time - chunk_max_delay_) {
+    flush_topic_chunks(time - chunk_max_delay_);
+  }
+  auto & chunk = topic_chunks_[channel_id];
+  const auto & data = *msg.serialized_data;
+  if (message_record_overhead + data.buffer_length >= chunk_size_) {
+    flush_topic_chunk(channel_id, chunk);
+    write_message(channel_id, time, msg.send_timestamp, data.buffer, data.buffer_length);
+    mcap_writer_->closeLastChunk();
+    return;
+  }
+  if (chunk.messages.empty()) {
+    chunk.first_time = time;
+    oldest_buffered_time_ = std::min(oldest_buffered_time_, time);
+  }
+  chunk.size += message_record_overhead + data.buffer_length;
+  chunk.messages.push_back({time, msg.send_timestamp,
+                            std::vector<uint8_t>(data.buffer, data.buffer + data.buffer_length)});
+  if (chunk.size >= chunk_size_) {
+    flush_topic_chunk(channel_id, chunk);
+  }
+}
+
+void MCAPStorage::flush_topic_chunk(mcap::ChannelId channel_id, TopicChunk & chunk)
+{
+  if (chunk.messages.empty()) {
+    return;
+  }
+  for (const auto & msg : chunk.messages) {
+    write_message(channel_id, msg.log_time, msg.publish_time, msg.data.data(), msg.data.size());
+  }
+  mcap_writer_->closeLastChunk();
+  chunk.messages.clear();
+  chunk.size = 0;
+}
+
+void MCAPStorage::flush_topic_chunks(rcutils_time_point_value_t older_than)
+{
+  oldest_buffered_time_ = std::numeric_limits<rcutils_time_point_value_t>::max();
+  for (auto & [channel_id, chunk] : topic_chunks_) {
+    if (chunk.messages.empty()) {
+      continue;
+    }
+    if (chunk.first_time <= older_than) {
+      flush_topic_chunk(channel_id, chunk);
+    } else {
+      oldest_buffered_time_ = std::min(oldest_buffered_time_, chunk.first_time);
+    }
+  }
 }
 
 void MCAPStorage::create_topic(const rosbag2_storage::TopicMetadata & topic,
