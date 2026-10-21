@@ -1058,6 +1058,55 @@ TEST_P(ParametrizedTemporaryDirectoryFixture, split_bag_standalone_file_and_rein
   EXPECT_EQ(metadata_io.read_metadata(options.uri).message_count, 3u);
 }
 
+class CapturingMetadataIo : public rosbag2_storage::MetadataIo
+{
+public:
+  explicit CapturingMetadataIo(rosbag2_storage::BagMetadata & captured)
+  : captured_(captured) {}
+
+  void write_metadata(
+    const std::string & uri, const rosbag2_storage::BagMetadata & metadata) override
+  {
+    captured_ = metadata;
+    MetadataIo::write_metadata(uri, metadata);
+  }
+
+private:
+  rosbag2_storage::BagMetadata & captured_;
+};
+
+TEST_P(ParametrizedTemporaryDirectoryFixture, bag_size_is_measured_in_the_bag_folder) {
+  rosbag2_storage::StorageOptions options;
+  options.uri = (fs::path(temporary_dir_path_) / "sized_bag").generic_string();
+  options.storage_id = GetParam();
+  ASSERT_NE(fs::current_path(), fs::path(options.uri));
+  rosbag2_storage::BagMetadata captured;
+  rosbag2_cpp::writers::SequentialWriter writer(
+    std::make_unique<rosbag2_storage::StorageFactory>(),
+    std::make_shared<rosbag2_cpp::SerializationFormatConverterFactory>(),
+    std::make_unique<CapturingMetadataIo>(captured));
+  writer.open(options, {"cdr", "cdr"});
+  writer.create_topic({0u, "t", "test_msgs/msg/BasicTypes", "cdr", {}, ""});
+  for (uint32_t i = 0; i < 3; ++i) {
+    if (i > 0) {
+      writer.split_bagfile();
+    }
+    auto msg = std::make_shared<rosbag2_storage::SerializedBagMessage>();
+    msg->serialized_data = rosbag2_storage::make_serialized_message(&i, sizeof(i));
+    msg->recv_timestamp = msg->send_timestamp = 100 * (i + 1);
+    msg->topic_name = "t";
+    writer.write(msg);
+  }
+  writer.close();
+  ASSERT_EQ(captured.relative_file_paths.size(), 3u);
+  uint64_t on_disk = 0;
+  for (const auto & path : captured.relative_file_paths) {
+    on_disk += fs::file_size(fs::path(options.uri) / path);
+  }
+  EXPECT_GT(on_disk, 0u);
+  EXPECT_EQ(captured.bag_size, on_disk);
+}
+
 INSTANTIATE_TEST_SUITE_P(
   SplitMetadataTest,
   ParametrizedTemporaryDirectoryFixture,

@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <sstream>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -46,6 +47,19 @@ namespace
 std::string strip_parent_path(const std::string & relative_path)
 {
   return fs::path(relative_path).filename().generic_string();
+}
+
+uint64_t bag_size(const std::string & base_folder, const std::vector<std::string> & files)
+{
+  uint64_t size = 0;
+  for (const auto & file : files) {
+    std::error_code ec;
+    const auto file_size = fs::file_size(fs::path(base_folder) / file, ec);
+    if (!ec) {
+      size += file_size;
+    }
+  }
+  return size;
 }
 }  // namespace
 
@@ -197,6 +211,8 @@ void SequentialWriter::flush_cache_update_metadata_and_close_storage()
     update_current_storage_metadata();
     storage_.reset();  // Destroy storage before calling WRITE_SPLIT callback to make sure that
     // bag file was closed before callback call.
+    // Closing the storage writes its index, so the last file is measured again.
+    metadata_.bag_size = bag_size(base_folder_, metadata_.relative_file_paths);
   }
 }
 
@@ -517,15 +533,7 @@ bool SequentialWriter::message_within_accepted_time_range(
 
 void SequentialWriter::finalize_metadata()
 {
-  metadata_.bag_size = 0;
-
-  for (const auto & path : metadata_.relative_file_paths) {
-    const auto bag_path = fs::path{path};
-
-    if (fs::exists(bag_path)) {
-      metadata_.bag_size += fs::file_size(bag_path);
-    }
-  }
+  metadata_.bag_size = bag_size(base_folder_, metadata_.relative_file_paths);
 
   metadata_.topics_with_message_count.clear();
   metadata_.topics_with_message_count.reserve(topics_names_to_info_.size());
