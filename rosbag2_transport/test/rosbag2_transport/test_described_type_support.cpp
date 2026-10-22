@@ -14,6 +14,10 @@
 
 #include <gmock/gmock.h>
 
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
+
 #include <chrono>
 #include <cstring>
 #include <memory>
@@ -154,6 +158,22 @@ TEST(DescribedTypeSupport, rejects_missing_dependencies_and_bad_lines)
   EXPECT_THROW(
     rosbag2_transport::DescribedTypeSupport("not a type", "int32 a\n"), std::runtime_error);
 }
+
+#ifdef __GLIBC__
+TEST(DescribedTypeSupport, failed_construction_releases_the_description)
+{
+  auto reject = [] {
+      for (int i = 0; i < 1000; ++i) {
+        EXPECT_THROW(
+          rosbag2_transport::DescribedTypeSupport("pkg/msg/A", "pkg/B b\n"), std::runtime_error);
+      }
+    };
+  reject();
+  const auto before = mallinfo2().uordblks;
+  reject();
+  EXPECT_LT(static_cast<int64_t>(mallinfo2().uordblks) - static_cast<int64_t>(before), 4096);
+}
+#endif
 
 TEST(DescribedTypeSupport, publishes_to_a_subscription_of_the_generated_type)
 {
