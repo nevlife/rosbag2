@@ -330,6 +330,13 @@ struct DescribedTypeSupport::Impl
   rosidl_runtime_c__type_description__TypeDescription description{};
   rosidl_runtime_c__type_description__TypeSource__Sequence sources{};
 
+  // Here rather than in ~DescribedTypeSupport, which does not run when the constructor throws.
+  ~Impl()
+  {
+    rosidl_runtime_c__type_description__TypeDescription__fini(&description);
+    rosidl_runtime_c__type_description__TypeSource__Sequence__fini(&sources);
+  }
+
   static const Impl & of(const rosidl_message_type_support_t * type_support)
   {
     return *reinterpret_cast<const Callbacks *>(type_support->data)->owner;
@@ -436,11 +443,7 @@ DescribedTypeSupport::DescribedTypeSupport(
     };
 }
 
-DescribedTypeSupport::~DescribedTypeSupport()
-{
-  rosidl_runtime_c__type_description__TypeDescription__fini(&impl_->description);
-  rosidl_runtime_c__type_description__TypeSource__Sequence__fini(&impl_->sources);
-}
+DescribedTypeSupport::~DescribedTypeSupport() = default;
 
 const rosidl_message_type_support_t & DescribedTypeSupport::type_support() const
 {
