@@ -27,6 +27,7 @@
 #include "rcl/graph.h"
 
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp/typesupport_helpers.hpp"
 #include "rcpputils/scope_exit.hpp"
 #include "rcpputils/unique_lock.hpp"
 #include "rcutils/time.h"
@@ -267,6 +268,7 @@ public:
 
     explicit PlayerPublisher(
       std::shared_ptr<rclcpp::GenericPublisher> pub,
+      const std::string & type,
       bool disable_loan_message)
     : publisher_(pub), generic_publisher_(std::move(pub))
     {
@@ -276,6 +278,7 @@ public:
       } else {
         publish_func_ =
           std::bind(&rclcpp::GenericPublisher::publish_as_loaned_msg, generic_publisher_, _1);
+        reserve_loan(type);
       }
     }
 
@@ -298,6 +301,24 @@ public:
     }
 
 private:
+    // A middleware may set up its loan pool on the first borrow (rmw_zenoh_cpp does), which would
+    // delay the first played message. Borrow once before playback starts.
+    void reserve_loan(const std::string & type)
+    {
+      auto library = rclcpp::get_typesupport_library(type, "rosidl_typesupport_cpp");
+      auto support =
+        rclcpp::get_message_typesupport_handle(type, "rosidl_typesupport_cpp", *library);
+      auto handle = generic_publisher_->get_publisher_handle().get();
+      void * message = nullptr;
+      if (RCL_RET_OK != rcl_borrow_loaned_message(handle, support, &message)) {
+        rcl_reset_error();
+        return;
+      }
+      if (RCL_RET_OK != rcl_return_loaned_message_from_publisher(handle, message)) {
+        rcl_reset_error();
+      }
+    }
+
     std::shared_ptr<rclcpp::PublisherBase> publisher_;
     std::shared_ptr<rclcpp::GenericPublisher> generic_publisher_;
     std::function<void(const rclcpp::SerializedMessage &)> publish_func_;
@@ -1335,6 +1356,10 @@ void PlayerImpl::prepare_publishers()
     // should not own transport-based functionality
     clock_publisher_ = owner_->create_publisher<rosgraph_msgs::msg::Clock>(
       "/clock", rclcpp::ClockQoS());
+    if (clock_publisher_->can_loan_messages()) {
+      // Set up the loan pool before playback, as PlayerPublisher does.
+      clock_publisher_->borrow_loaned_message();
+    }
   }
 
   if (play_options_.clock_publish_frequency > 0.f) {
@@ -1411,7 +1436,8 @@ void PlayerImpl::prepare_publishers()
         std::shared_ptr<rclcpp::GenericPublisher> pub =
           owner_->create_generic_publisher(topic.name, topic.type, topic_qos);
         std::shared_ptr<PlayerPublisher> player_pub =
-          std::make_shared<PlayerPublisher>(std::move(pub), play_options_.disable_loan_message);
+          std::make_shared<PlayerPublisher>(
+          std::move(pub), topic.type, play_options_.disable_loan_message);
         publishers_.insert(std::make_pair(topic.name, player_pub));
         if (play_options_.wait_acked_timeout >= 0 &&
           topic_qos.reliability() == rclcpp::ReliabilityPolicy::BestEffort)
