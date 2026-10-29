@@ -58,6 +58,11 @@ Node convert<rosbag2_transport::PlayOptions>::encode(
     std::chrono::nanoseconds(play_options.wait_acked_timeout));
 
   node["disable_loan_message"] = play_options.disable_loan_message;
+  node["lockstep_trigger_topic"] = play_options.lockstep_trigger_topic;
+  node["lockstep_done_topic"] = play_options.lockstep_done_topic;
+  node["lockstep_timeout"] = play_options.lockstep_timeout;
+  node["lockstep_probe"] = play_options.lockstep_probe;
+  node["lockstep_gap"] = play_options.lockstep_gap;
 
   return node;
 }
@@ -113,6 +118,12 @@ bool convert<rosbag2_transport::PlayOptions>::decode(
   play_options.wait_acked_timeout = wait_acked_timeout.nanoseconds();
 
   optional_assign<bool>(node, "disable_loan_message", play_options.disable_loan_message);
+  optional_assign<std::string>(
+    node, "lockstep_trigger_topic", play_options.lockstep_trigger_topic);
+  optional_assign<std::string>(node, "lockstep_done_topic", play_options.lockstep_done_topic);
+  optional_assign<rclcpp::Duration>(node, "lockstep_timeout", play_options.lockstep_timeout);
+  optional_assign<rclcpp::Duration>(node, "lockstep_probe", play_options.lockstep_probe);
+  optional_assign<rclcpp::Duration>(node, "lockstep_gap", play_options.lockstep_gap);
 
   return true;
 }

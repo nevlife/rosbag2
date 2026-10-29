@@ -14,8 +14,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <regex>
 #include <string>
@@ -79,6 +81,25 @@ rclcpp::QoS publisher_qos_for_topic(
   return Rosbag2QoS::adapt_offer_to_recorded_offers(
     topic.name,
     rosbag2_storage::from_rclcpp_qos_vector(topic.offered_qos_profiles));
+}
+
+/// Header stamp of a serialized message that starts with std_msgs/Header, after the 4-byte CDR
+/// encapsulation: int32 sec, uint32 nanosec.
+std::optional<rcutils_time_point_value_t> header_stamp_ns(const rcutils_uint8_array_t & cdr)
+{
+  if (cdr.buffer_length < 12) {
+    return std::nullopt;
+  }
+  const bool little_endian = cdr.buffer[1] & 1;
+  auto read_u32 = [&cdr, little_endian](size_t offset) {
+      uint32_t value = 0;
+      for (size_t i = 0; i < 4; ++i) {
+        value |= static_cast<uint32_t>(cdr.buffer[offset + (little_endian ? i : 3 - i)]) << (8 * i);
+      }
+      return value;
+    };
+  return static_cast<rcutils_time_point_value_t>(static_cast<int32_t>(read_u32(4))) *
+         RCUTILS_S_TO_NS(1) + read_u32(8);
 }
 }  // namespace
 
@@ -343,6 +364,28 @@ private:
 
   void wait_for_filled_queue() const;
   void play_messages_from_queue();
+
+  bool lockstep_enabled() const {return !play_options_.lockstep_trigger_topic.empty();}
+  void start_lockstep();
+  void stop_lockstep();
+  void wait_for_lockstep_done(const rosbag2_storage::SerializedBagMessage & message);
+  rclcpp::CallbackGroup::SharedPtr lockstep_callback_group_;
+  rclcpp::GenericSubscription::SharedPtr lockstep_done_subscription_;
+  std::unique_ptr<rclcpp::executors::SingleThreadedExecutor> lockstep_executor_;
+  std::thread lockstep_spin_thread_;
+  std::mutex lockstep_mutex_;
+  std::condition_variable lockstep_cv_;
+  rcutils_time_point_value_t lockstep_done_ns_ RCPPUTILS_TSA_GUARDED_BY(lockstep_mutex_) = 0;
+  // Header stamp of the published trigger that has no done message yet; playback thread only.
+  std::optional<rcutils_time_point_value_t> lockstep_pending_ns_;
+  std::unordered_map<std::string, std::chrono::steady_clock::time_point> lockstep_last_publish_;
+  struct
+  {
+    size_t triggers = 0;
+    size_t done = 0;
+    size_t timeouts = 0;
+    size_t released_early = 0;
+  } lockstep_stats_;
   void prepare_publishers();
   std::shared_ptr<DescribedTypePublisher> create_described_type_publisher(
     const rosbag2_storage::TopicMetadata & topic, const rclcpp::QoS & qos);
@@ -580,6 +623,9 @@ bool PlayerImpl::play()
           std::chrono::nanoseconds delay_duration(delay.nanoseconds());
           std::this_thread::sleep_for(delay_duration);
         }
+        if (lockstep_enabled()) {
+          start_lockstep();
+        }
         do {
           {
             // By locking main_play_loop_mutex_ we make sure that seek(time_point) will not be
@@ -612,6 +658,9 @@ bool PlayerImpl::play()
         } while (rclcpp::ok() && !stop_playback_ && play_options_.loop);
       } catch (const std::exception & e) {
         RCLCPP_ERROR(owner_->get_logger(), "Failed to play: %s", e.what());
+      }
+      if (lockstep_enabled()) {
+        stop_lockstep();
       }
 
       if (clock_publish_timer_ != nullptr) {
@@ -1175,9 +1224,12 @@ void PlayerImpl::play_messages_from_queue()
       {
         break;
       }
+      if (lockstep_enabled() && !play_next_.load()) {
+        wait_for_lockstep_done(*message_ptr);
+      }
       // Sleep until the message's replay time, do not move on until sleep_until returns true
-      // However, skip sleeping if we're trying to play the next message
-      while (rclcpp::ok() && !stop_playback_ && !play_next_.load() &&
+      // However, skip sleeping if we're trying to play the next message or play in lockstep
+      while (rclcpp::ok() && !stop_playback_ && !play_next_.load() && !lockstep_enabled() &&
         !clock_->sleep_until(message_ptr->recv_timestamp))
       {
         // Stop sleeping if cancelled
@@ -1216,7 +1268,24 @@ void PlayerImpl::play_messages_from_queue()
       bool message_published = false;
       // We shall respect shall_stop_at_timestamp() even do play_next in pause mode
       if (!shall_stop_at_timestamp(message_ptr->recv_timestamp)) {
+        // In lockstep the clock follows the messages, and never runs backwards: it keeps running
+        // while the node under test works.
+        if (lockstep_enabled()) {
+          if (clock_->now() < message_ptr->recv_timestamp) {
+            clock_->jump(message_ptr->recv_timestamp);
+          }
+          auto & last = lockstep_last_publish_[message_ptr->topic_name];
+          std::this_thread::sleep_until(
+            last + std::chrono::nanoseconds(play_options_.lockstep_gap.nanoseconds()));
+          last = std::chrono::steady_clock::now();
+        }
         message_published = publish_message(message_ptr);
+        if (message_published && lockstep_enabled() &&
+          message_ptr->topic_name == play_options_.lockstep_trigger_topic)
+        {
+          lockstep_pending_ns_ = header_stamp_ns(*message_ptr->serialized_data);
+          ++lockstep_stats_.triggers;
+        }
       }
 
       // If we tried to publish because of play_next(), jump the clock
@@ -1522,6 +1591,133 @@ void PlayerImpl::run_play_msg_post_callbacks(
     if (post_callback_data.callback != nullptr) {  // Sanity check
       post_callback_data.callback(message);
     }
+  }
+}
+
+void PlayerImpl::start_lockstep()
+{
+  lockstep_stats_ = {};
+  lockstep_pending_ns_.reset();
+  lockstep_last_publish_.clear();
+  {
+    std::lock_guard<std::mutex> lk(lockstep_mutex_);
+    lockstep_done_ns_ = std::numeric_limits<rcutils_time_point_value_t>::min();
+  }
+  if (lockstep_done_subscription_ == nullptr) {
+    const auto done_topic = owner_->get_node_topics_interface()->resolve_topic_name(
+      play_options_.lockstep_done_topic);
+    RCLCPP_INFO_STREAM(owner_->get_logger(), "Lockstep: waiting for a publisher on " << done_topic);
+    std::string type;
+    while (rclcpp::ok() && !stop_playback_ && type.empty()) {
+      const auto topics = owner_->get_topic_names_and_types();
+      const auto it = topics.find(done_topic);
+      if (it != topics.end() && !it->second.empty()) {
+        type = it->second.front();
+      } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+    }
+    if (type.empty()) {
+      return;
+    }
+    // Match the publisher: a reliable subscription would not receive from a best effort one.
+    rclcpp::QoS qos(rclcpp::KeepLast(100));
+    const auto publishers = owner_->get_publishers_info_by_topic(done_topic);
+    if (!publishers.empty()) {
+      qos.reliability(publishers.front().qos_profile().reliability());
+    }
+    // Its own executor, so the done messages arrive whether or not the player node is spun.
+    lockstep_callback_group_ = owner_->create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive, false);
+    rclcpp::SubscriptionOptions options;
+    options.callback_group = lockstep_callback_group_;
+    lockstep_done_subscription_ = owner_->create_generic_subscription(
+      done_topic, type, qos,
+      [this](std::shared_ptr<const rclcpp::SerializedMessage> message) {
+        const auto stamp = header_stamp_ns(message->get_rcl_serialized_message());
+        if (!stamp) {
+          return;
+        }
+        {
+          std::lock_guard<std::mutex> lk(lockstep_mutex_);
+          lockstep_done_ns_ = std::max(lockstep_done_ns_, *stamp);
+        }
+        lockstep_cv_.notify_all();
+      }, options);
+    lockstep_executor_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
+    lockstep_executor_->add_callback_group(
+      lockstep_callback_group_, owner_->get_node_base_interface());
+    lockstep_spin_thread_ = std::thread([this]() {lockstep_executor_->spin();});
+  }
+  const auto trigger = publishers_.find(play_options_.lockstep_trigger_topic);
+  if (trigger == publishers_.end()) {
+    RCLCPP_WARN_STREAM(
+      owner_->get_logger(), "Lockstep: the bag has no topic " <<
+        play_options_.lockstep_trigger_topic << " to play");
+    return;
+  }
+  // A trigger published before the node subscribes would never be answered.
+  while (rclcpp::ok() && !stop_playback_ &&
+    trigger->second->publisher()->get_subscription_count() == 0)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+}
+
+void PlayerImpl::stop_lockstep()
+{
+  if (lockstep_pending_ns_) {
+    rosbag2_storage::SerializedBagMessage last;
+    last.topic_name = play_options_.lockstep_trigger_topic;
+    wait_for_lockstep_done(last);
+  }
+  RCLCPP_INFO_STREAM(
+    owner_->get_logger(), "Lockstep: " << lockstep_stats_.triggers << " triggers, " <<
+      lockstep_stats_.done << " done, " << lockstep_stats_.timeouts << " timed out, " <<
+      lockstep_stats_.released_early << " messages released before done");
+  if (lockstep_executor_ != nullptr) {
+    lockstep_executor_->cancel();
+    if (lockstep_spin_thread_.joinable()) {
+      lockstep_spin_thread_.join();
+    }
+    lockstep_executor_.reset();
+  }
+  lockstep_done_subscription_.reset();
+  lockstep_callback_group_.reset();
+}
+
+void PlayerImpl::wait_for_lockstep_done(const rosbag2_storage::SerializedBagMessage & message)
+{
+  if (!lockstep_pending_ns_) {
+    return;
+  }
+  // The node works on the trigger now. Holding the messages after it keeps them from overflowing
+  // its queues meanwhile; one that it needs to finish is released after the probe time.
+  const bool is_trigger = message.topic_name == play_options_.lockstep_trigger_topic;
+  const auto limit = is_trigger ? play_options_.lockstep_timeout : play_options_.lockstep_probe;
+  const auto deadline =
+    std::chrono::steady_clock::now() + std::chrono::nanoseconds(limit.nanoseconds());
+  bool done = false;
+  {
+    std::unique_lock<std::mutex> lk(lockstep_mutex_);
+    while (true) {
+      done = lockstep_done_ns_ >= *lockstep_pending_ns_;
+      const auto now = std::chrono::steady_clock::now();
+      if (done || !rclcpp::ok() || stop_playback_ || now >= deadline) {
+        break;
+      }
+      // Wake up regularly to notice stop().
+      lockstep_cv_.wait_until(lk, std::min(deadline, now + std::chrono::milliseconds(10)));
+    }
+  }
+  if (done) {
+    ++lockstep_stats_.done;
+    lockstep_pending_ns_.reset();
+  } else if (is_trigger) {
+    ++lockstep_stats_.timeouts;
+    lockstep_pending_ns_.reset();
+  } else {
+    ++lockstep_stats_.released_early;
   }
 }
 

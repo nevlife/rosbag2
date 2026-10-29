@@ -174,6 +174,25 @@ Messages from all provided bags will be played in order, based on their original
 
 When fixed-frequency `/clock` publication is enabled with `--clock` or the `play.clock_publish_frequency` node parameter, `/clock` is published only while a playback session is active. If the Player node remains alive after playback finishes or is stopped, clock publication stops. Starting another playback session restarts it. Pausing playback does not end the session; fixed-frequency updates continue with the paused time.
 
+#### Lockstep playback
+
+Played at a fixed rate, a bag either takes as long as the recording or outruns the node under test, whose subscription queues then drop messages.
+Lockstep playback paces the bag by the node instead: after each trigger message it waits for the node's output for that trigger, so the bag plays as fast as the node processes, without losses, and the node receives the same messages in the same order on every run.
+
+```
+$ ros2 bag play <bag> --lockstep /velodyne_points /cloud_registered_body
+```
+
+* After each message on the trigger topic (`/velodyne_points`), the player waits until a message on the done topic (`/cloud_registered_body`) carries a header stamp at or after the trigger's header stamp. Both topics carry a `std_msgs/Header` first.
+* Choose the last message the node publishes for a trigger. A node that publishes its result first and then keeps working would otherwise receive the next messages while it is still busy.
+* Messages recorded after the trigger are held while the node works. If the node needs some of them to finish, each is released after `--lockstep-probe` seconds (default 0.02).
+* Without a done message for `--lockstep-timeout` seconds (default 1.0), the next trigger is published anyway; the player logs how many triggers timed out.
+* Messages on the same topic are at least `--lockstep-gap` seconds apart (default 0.0002), so that the node takes each one before the next arrives.
+* Messages are published without waiting for their replay time. The player clock follows the messages and never runs backwards. A node that processes on a timer of the ROS clock should run with `use_sim_time:=false`: while the player waits, simulated time does not advance far enough for such a timer to fire.
+* The player waits for a publisher on the done topic and a subscription on the trigger topic before it starts.
+
+The same options are available as `lockstep_trigger_topic`, `lockstep_done_topic`, `lockstep_timeout`, `lockstep_probe`, and `lockstep_gap` in `PlayOptions` and as `play.lockstep_*` node parameters.
+
 #### Controlling playback via services
 
 The Rosbag2 player provides the following services for remote control, which can be called via `ros2 service` commandline or from your nodes,

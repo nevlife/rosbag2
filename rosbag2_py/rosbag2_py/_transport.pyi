@@ -13,6 +13,11 @@ class PlayOptions:
     exclude_regex_to_filter: str
     exclude_service_events_to_filter: List[str]
     exclude_topics_to_filter: List[str]
+    lockstep_done_topic: str
+    lockstep_gap: float
+    lockstep_probe: float
+    lockstep_timeout: float
+    lockstep_trigger_topic: str
     loop: bool
     node_prefix: str
     playback_duration: float

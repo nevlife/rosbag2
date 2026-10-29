@@ -164,6 +164,25 @@ class PlayVerb(VerbExtension):
                  'RELIABLE.',
             metavar='TIMEOUT')
         parser.add_argument(
+            '--lockstep', nargs=2, metavar=('TRIGGER_TOPIC', 'DONE_TOPIC'),
+            help='Publish messages as soon as the node under test is ready instead of at their '
+                 'replay time: after each TRIGGER_TOPIC message, wait until a DONE_TOPIC message '
+                 "carries a header stamp at or after the trigger's. Both topics carry a "
+                 'std_msgs/Header first. Choose the last output the node publishes for a '
+                 'trigger, and run the node on its own clock (use_sim_time false) when it '
+                 'processes on a timer.')
+        parser.add_argument(
+            '--lockstep-timeout', type=check_positive_float, default=1.0,
+            help='Seconds to wait for DONE_TOPIC before the next trigger is published anyway.')
+        parser.add_argument(
+            '--lockstep-probe', type=check_not_negative_float, default=0.02,
+            help='Seconds to wait for DONE_TOPIC before each message that is not a trigger is '
+                 'published anyway, for nodes that need messages recorded after the trigger.')
+        parser.add_argument(
+            '--lockstep-gap', type=check_not_negative_float, default=0.0002,
+            help='Seconds between two messages on the same topic in lockstep playback, so that '
+                 'the node takes each one before the next arrives.')
+        parser.add_argument(
             '--disable-loan-message', action='store_true', default=False,
             help='Disable to publish as loaned message. '
                  'By default, if loaned message can be used, messages are published as loaned '
@@ -281,6 +300,11 @@ class PlayVerb(VerbExtension):
         play_options.start_offset = args.start_offset
         play_options.wait_acked_timeout = args.wait_for_all_acked
         play_options.disable_loan_message = args.disable_loan_message
+        if args.lockstep:
+            play_options.lockstep_trigger_topic, play_options.lockstep_done_topic = args.lockstep
+        play_options.lockstep_timeout = args.lockstep_timeout
+        play_options.lockstep_probe = args.lockstep_probe
+        play_options.lockstep_gap = args.lockstep_gap
         play_options.publish_service_requests = args.publish_service_requests
         if not args.service_requests_source or \
                 args.service_requests_source == 'service_introspection':

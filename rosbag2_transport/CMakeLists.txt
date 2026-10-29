@@ -123,6 +123,7 @@ if(BUILD_TESTING)
 
   find_package(ament_cmake_gmock REQUIRED)
   find_package(ament_index_cpp REQUIRED)
+  find_package(std_msgs REQUIRED)
   find_package(ament_lint_auto REQUIRED)
   find_package(composition_interfaces REQUIRED)
   find_package(rosbag2_test_common REQUIRED)
@@ -225,6 +226,19 @@ if(BUILD_TESTING)
     )
   endfunction()
   call_for_each_rmw_implementation(test_play_publish_clock_for_rmw_implementation)
+
+  ament_add_gmock_executable(test_play_lockstep test/rosbag2_transport/test_play_lockstep.cpp)
+  target_link_libraries(test_play_lockstep
+    rosbag2_transport ${std_msgs_TARGETS} rosbag2_test_common::rosbag2_test_common)
+  function(test_play_lockstep_for_rmw_implementation)
+    set(rmw_implementation_env_var RMW_IMPLEMENTATION=${rmw_implementation})
+
+    ament_add_gmock_test(test_play_lockstep
+      TEST_NAME test_play_lockstep${target_suffix}
+      ENV ${rmw_implementation_env_var}
+    )
+  endfunction()
+  call_for_each_rmw_implementation(test_play_lockstep_for_rmw_implementation)
 
   ament_add_gmock_executable(test_play_timing test/rosbag2_transport/test_play_timing.cpp)
   target_link_libraries(test_play_timing rosbag2_transport ${test_msgs_TARGETS} rosbag2_test_common::rosbag2_test_common)

@@ -123,6 +123,25 @@ public:
 
   // The source of the service request
   ServiceRequestsSource service_requests_source = ServiceRequestsSource::SERVICE_INTROSPECTION;
+
+  // Lockstep playback: messages are published without waiting for their replay time, and after
+  // each message on lockstep_trigger_topic the player waits until a message on
+  // lockstep_done_topic carries a header stamp at or after the trigger's header stamp. Both
+  // topics carry a std_msgs/Header first. An empty trigger topic disables lockstep playback.
+  std::string lockstep_trigger_topic = "";
+  std::string lockstep_done_topic = "";
+
+  // Longest wait for the done message before the next trigger message is published anyway.
+  rclcpp::Duration lockstep_timeout = rclcpp::Duration(1, 0);
+
+  // Longest wait for the done message before each message that is not a trigger is published
+  // anyway, for nodes that need messages recorded after the trigger to finish.
+  rclcpp::Duration lockstep_probe = rclcpp::Duration(0, 20000000);
+
+  // Shortest time between two published messages on the same topic, so that the node under test
+  // takes each one before the next arrives: a burst longer than its subscription queue would
+  // push out messages it has not taken.
+  rclcpp::Duration lockstep_gap = rclcpp::Duration(0, 200000);
 };
 
 }  // namespace rosbag2_transport

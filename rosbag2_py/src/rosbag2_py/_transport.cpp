@@ -122,6 +122,39 @@ public:
     return RCUTILS_NS_TO_S(static_cast<double>(this->delay.nanoseconds()));
   }
 
+  void setLockstepTimeout(double timeout)
+  {
+    this->lockstep_timeout = rclcpp::Duration::from_nanoseconds(
+      static_cast<rcl_duration_value_t>(RCUTILS_S_TO_NS(timeout)));
+  }
+
+  double getLockstepTimeout() const
+  {
+    return RCUTILS_NS_TO_S(static_cast<double>(this->lockstep_timeout.nanoseconds()));
+  }
+
+  void setLockstepProbe(double probe)
+  {
+    this->lockstep_probe = rclcpp::Duration::from_nanoseconds(
+      static_cast<rcl_duration_value_t>(RCUTILS_S_TO_NS(probe)));
+  }
+
+  double getLockstepProbe() const
+  {
+    return RCUTILS_NS_TO_S(static_cast<double>(this->lockstep_probe.nanoseconds()));
+  }
+
+  void setLockstepGap(double gap)
+  {
+    this->lockstep_gap = rclcpp::Duration::from_nanoseconds(
+      static_cast<rcl_duration_value_t>(RCUTILS_S_TO_NS(gap)));
+  }
+
+  double getLockstepGap() const
+  {
+    return RCUTILS_NS_TO_S(static_cast<double>(this->lockstep_gap.nanoseconds()));
+  }
+
   void setStartOffset(double start_offset)
   {
     this->start_offset = static_cast<rcutils_time_point_value_t>(RCUTILS_S_TO_NS(start_offset));
@@ -923,6 +956,20 @@ PYBIND11_MODULE(_transport, m) {
   .def_readwrite("disable_loan_message", &PlayOptions::disable_loan_message)
   .def_readwrite("publish_service_requests", &PlayOptions::publish_service_requests)
   .def_readwrite("service_requests_source", &PlayOptions::service_requests_source)
+  .def_readwrite("lockstep_trigger_topic", &PlayOptions::lockstep_trigger_topic)
+  .def_readwrite("lockstep_done_topic", &PlayOptions::lockstep_done_topic)
+  .def_property(
+    "lockstep_timeout",
+    &PlayOptions::getLockstepTimeout,
+    &PlayOptions::setLockstepTimeout)
+  .def_property(
+    "lockstep_probe",
+    &PlayOptions::getLockstepProbe,
+    &PlayOptions::setLockstepProbe)
+  .def_property(
+    "lockstep_gap",
+    &PlayOptions::getLockstepGap,
+    &PlayOptions::setLockstepGap)
   ;
 
   py::enum_<rosbag2_transport::ServiceRequestsSource>(m, "ServiceRequestsSource")

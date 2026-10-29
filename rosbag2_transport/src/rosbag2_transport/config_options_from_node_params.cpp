@@ -218,6 +218,17 @@ PlayOptions get_play_options_from_node_params(rclcpp::Node & node)
   play_options.disable_loan_message =
     node.declare_parameter<bool>("play.disable_loan_message", false);
 
+  play_options.lockstep_trigger_topic =
+    node.declare_parameter<std::string>("play.lockstep_trigger_topic", "");
+  play_options.lockstep_done_topic =
+    node.declare_parameter<std::string>("play.lockstep_done_topic", "");
+  play_options.lockstep_timeout = param_utils::get_duration_from_node_param(
+    node, "play.lockstep_timeout", 1, 0);
+  play_options.lockstep_probe = param_utils::get_duration_from_node_param(
+    node, "play.lockstep_probe", 0, 20000000);
+  play_options.lockstep_gap = param_utils::get_duration_from_node_param(
+    node, "play.lockstep_gap", 0, 200000);
+
   // "SERVICE_INTROSPECTION" or "CLIENT_INTROSPECTION"
   auto service_requests_source =
     node.declare_parameter<std::string>("play.service_requests_source", "SERVICE_INTROSPECTION");
